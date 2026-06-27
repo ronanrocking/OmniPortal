@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniPortal Host</title>
+  <link rel="stylesheet" href="/frontend/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <section class="hero-card">
+      <span class="eyebrow">Host Page</span>
+      <h1>Host this browser.</h1>
+      <p class="hero-copy">Register a host name, stay available for one client, and exchange messages directly over WebRTC once a client connects.</p>
+
+      <div class="toolbar">
+        <div class="page-links">
+          <a class="text-link" href="/">Back home</a>
+          <a class="text-link" href="/client">Switch to client page</a>
+          <a class="text-link" href="/admin">Open admin dashboard</a>
+        </div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="metric-card">
+          Current role
+          <strong id="currentRoleMetric">Not hosting</strong>
+        </div>
+        <div class="metric-card">
+          WebSocket
+          <strong id="socketMetric">Disconnected</strong>
+        </div>
+        <div class="metric-card">
+          Peer link
+          <strong id="peerMetric">Idle</strong>
+        </div>
+      </div>
+
+      <div class="status-box" id="statusBox">Enter a host name and start hosting.</div>
+    </section>
+
+    <section class="page-grid">
+      <article class="panel">
+        <div class="panel-inner">
+          <div class="panel-header">
+            <h2>Host Controls</h2>
+          </div>
+          <p class="panel-copy">This page only manages host behavior. Clients connect from the separate client page.</p>
+
+          <div class="form-stack">
+            <input id="hostNameInput" maxlength="50" placeholder="Enter a host name">
+            <div class="button-row">
+              <button class="primary-button" id="startHostButton">Start Hosting</button>
+              <button class="secondary-button" id="resetSessionButton">Reset Browser Session</button>
+            </div>
+          </div>
+
+          <div class="list-grid" id="mePanel">
+            <div class="empty-card">This browser is not hosting yet.</div>
+          </div>
+        </div>
+      </article>
+
+      <div class="list-grid">
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Current Connection</h2>
+              <button class="secondary-button hidden" id="leavePairButton">Disconnect Client</button>
+            </div>
+            <div class="list-grid" id="connectionPanel">
+              <div class="empty-card">No client is connected right now.</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Chat</h2>
+              <span class="tiny-note" id="chatCaption">A client must connect before messages can be sent.</span>
+            </div>
+            <div class="chat-log" id="chatLog">
+              <div class="chat-row system">Waiting for a client to connect.</div>
+            </div>
+            <div class="form-stack">
+              <input id="chatInput" maxlength="400" placeholder="Type a message to the connected client" disabled>
+              <button class="primary-button" id="sendMessageButton" disabled>Send Message</button>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/frontend/host.js"></script>
+</body>
+</html>

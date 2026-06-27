@@ -1,5 +1,8 @@
 services:
   backend:
-    build: ./apps/backend
+    build:
+      context: .
+      dockerfile: ./apps/backend/Dockerfile
+    restart: unless-stopped
     ports:
       - "8000:8000"

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniPortal</title>
+  <link rel="stylesheet" href="/frontend/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <section class="hero-card">
+      <span class="eyebrow">OmniPortal</span>
+      <h1>Choose a role for this browser.</h1>
+      <p class="hero-copy">Hosts and clients now live on separate pages. The admin dashboard is a separate read-only link that never changes browser role or session state.</p>
+
+      <div class="choice-grid">
+        <a class="choice-card" href="/host">
+          <span class="choice-badge host">Host</span>
+          <h2>Become a host</h2>
+          <p>Register this browser as an available host and chat directly with one client at a time over WebRTC.</p>
+        </a>
+
+        <a class="choice-card" href="/client">
+          <span class="choice-badge client">Client</span>
+          <h2>Become a client</h2>
+          <p>Browse connected hosts, choose one, and start a direct browser-to-browser chat session.</p>
+        </a>
+      </div>
+
+      <div class="admin-link-row">
+        <span class="tiny-note">Read-only admin dashboard:</span>
+        <a class="text-link" href="/admin">/admin</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

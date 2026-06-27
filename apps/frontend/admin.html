@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniPortal Admin</title>
+  <link rel="stylesheet" href="/frontend/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <section class="hero-card">
+      <span class="eyebrow">Admin Dashboard</span>
+      <h1>Read-only system overview.</h1>
+      <p class="hero-copy">This page never changes host or client roles. It only observes connected hosts, connected clients, active connections, and active sessions.</p>
+
+      <div class="toolbar">
+        <div class="page-links">
+          <a class="text-link" href="/">Back home</a>
+          <a class="text-link" href="/host">Host page</a>
+          <a class="text-link" href="/client">Client page</a>
+        </div>
+        <div class="button-row">
+          <button class="secondary-button" id="refreshAdminButton">Refresh Now</button>
+        </div>
+      </div>
+
+      <div class="stats-grid" id="statsGrid">
+        <div class="metric-card">
+          Connected hosts
+          <strong id="hostsCount">0</strong>
+        </div>
+        <div class="metric-card">
+          Connected clients
+          <strong id="clientsCount">0</strong>
+        </div>
+        <div class="metric-card">
+          Active connections
+          <strong id="connectionsCount">0</strong>
+        </div>
+        <div class="metric-card">
+          Active sessions
+          <strong id="sessionsCount">0</strong>
+        </div>
+      </div>
+
+      <div class="status-box" id="statusBox">Waiting for the first admin refresh.</div>
+    </section>
+
+    <section class="page-grid">
+      <div class="list-grid">
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Connected Hosts</h2>
+            </div>
+            <div class="list-grid" id="hostsList">
+              <div class="empty-card">No connected hosts yet.</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Connected Clients</h2>
+            </div>
+            <div class="list-grid" id="clientsList">
+              <div class="empty-card">No connected clients yet.</div>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="list-grid">
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Active Connections</h2>
+            </div>
+            <div class="list-grid" id="connectionsList">
+              <div class="empty-card">No host/client pairings are active.</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-inner">
+            <div class="panel-header">
+              <h2>Active Sessions</h2>
+            </div>
+            <div class="list-grid" id="sessionsList">
+              <div class="empty-card">No active sessions yet.</div>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/frontend/admin.js"></script>
+</body>
+</html>
