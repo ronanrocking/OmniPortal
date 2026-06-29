@@ -7,97 +7,47 @@
   <link rel="stylesheet" href="/frontend/styles.css">
 </head>
 <body>
-  <main class="page-shell">
-    <section class="hero-card">
-      <span class="eyebrow">Client Page</span>
-      <h1>Connect as a client.</h1>
-      <p class="hero-copy">Join as a client, pick a currently connected host, and then chat directly with that host over WebRTC.</p>
+  <main class="flow-shell">
+    <section class="center-stage" id="connectScreen">
+      <div class="stage-card connect-card">
+        <span class="eyebrow">OmniPortal Client</span>
+        <h1>Enter the host PIN.</h1>
+        <p class="stage-copy">This browser connects to OmniPortal automatically. Enter the 6-digit host PIN from the desktop host app to begin a direct session.</p>
 
-      <div class="toolbar">
-        <div class="page-links">
-          <a class="text-link" href="/">Back home</a>
-          <a class="text-link" href="/host">Switch to host page</a>
-          <a class="text-link" href="/admin">Open admin dashboard</a>
+        <div class="pin-input-wrap">
+          <input id="hostCodeInput" class="pin-input" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" aria-label="6 digit host pin">
         </div>
+
+        <div class="status-line" id="statusBox">Connecting to OmniPortal...</div>
       </div>
-
-      <div class="panel-grid">
-        <div class="metric-card">
-          Current role
-          <strong id="currentRoleMetric">Not a client</strong>
-        </div>
-        <div class="metric-card">
-          WebSocket
-          <strong id="socketMetric">Disconnected</strong>
-        </div>
-        <div class="metric-card">
-          Peer link
-          <strong id="peerMetric">Idle</strong>
-        </div>
-      </div>
-
-      <div class="status-box" id="statusBox">Enable client mode to begin browsing live hosts.</div>
     </section>
 
-    <section class="page-grid">
-      <article class="panel">
-        <div class="panel-inner">
-          <div class="panel-header">
-            <h2>Client Controls</h2>
+    <section class="session-stage hidden" id="chatScreen">
+      <div class="session-frame">
+        <div class="session-header">
+          <div>
+            <span class="eyebrow">Connected</span>
+            <h1 id="sessionTitle">OmniPortal Chat</h1>
+            <p class="stage-copy" id="sessionSubtitle">Connected to the selected host.</p>
           </div>
-          <p class="panel-copy">This page only manages client behavior. Hosts register themselves on the separate host page.</p>
-
-          <div class="button-row" style="margin-top: 18px;">
-            <button class="primary-button" id="joinClientButton">Enable Client Mode</button>
-            <button class="secondary-button" id="refreshHostsButton">Refresh Hosts</button>
-            <button class="secondary-button" id="resetSessionButton">Reset Browser Session</button>
-          </div>
-
-          <div class="list-grid" style="margin-top: 18px;" id="mePanel">
-            <div class="empty-card">This browser is not acting as a client yet.</div>
-          </div>
-
-          <div class="panel-header" style="margin-top: 22px;">
-            <h2>Available Hosts</h2>
-            <button class="secondary-button hidden" id="leavePairButton">Disconnect Host</button>
-          </div>
-          <div class="list-grid" id="hostList">
-            <div class="empty-card">No hosts are visible yet.</div>
-          </div>
+          <button class="secondary-button" id="leavePairButton">Disconnect</button>
         </div>
-      </article>
 
-      <div class="list-grid">
-        <article class="panel">
-          <div class="panel-inner">
-            <div class="panel-header">
-              <h2>Current Connection</h2>
-            </div>
-            <div class="list-grid" id="connectionPanel">
-              <div class="empty-card">No host is connected right now.</div>
-            </div>
-          </div>
-        </article>
+        <div class="status-line session-line" id="sessionStatusBox">Direct peer session is active.</div>
 
-        <article class="panel">
-          <div class="panel-inner">
-            <div class="panel-header">
-              <h2>Chat</h2>
-              <span class="tiny-note" id="chatCaption">A host must be connected before messages can be sent.</span>
-            </div>
-            <div class="chat-log" id="chatLog">
-              <div class="chat-row system">Waiting for a host to connect.</div>
-            </div>
-            <div class="form-stack">
-              <input id="chatInput" maxlength="400" placeholder="Type a message to the connected host" disabled>
-              <button class="primary-button" id="sendMessageButton" disabled>Send Message</button>
-            </div>
+        <section class="chat-shell">
+          <div class="chat-log" id="chatLog">
+            <div class="chat-row system">Waiting for the host to connect.</div>
           </div>
-        </article>
+          <div class="chat-compose">
+            <input id="chatInput" maxlength="400" placeholder="Type a message to the connected host" disabled>
+            <button class="primary-button" id="sendMessageButton" disabled>Send</button>
+          </div>
+        </section>
       </div>
     </section>
   </main>
 
-  <script type="module" src="/frontend/client.js"></script>
+  <script type="module" src="/frontend/client.js?v=20260628c"></script>
 </body>
 </html>

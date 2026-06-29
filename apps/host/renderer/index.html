@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniPortal Host</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="host-shell">
+    <section class="host-screen" id="waitingScreen">
+      <div class="host-card">
+        <span class="eyebrow">Desktop Host</span>
+        <h1>OmniPortal Host</h1>
+        <p class="hero-copy">This host connects automatically and waits for a client to enter the 6-digit host PIN.</p>
+
+        <div class="detail-list">
+          <div class="detail-row">
+            <div>
+              <span class="detail-label">Name</span>
+              <div class="detail-value" id="displayNameValue">Loading...</div>
+            </div>
+            <button class="subtle-button" data-edit="display_name">Edit</button>
+          </div>
+
+          <div class="detail-row">
+            <div>
+              <span class="detail-label">Host PIN</span>
+              <div class="detail-value mono" id="hostCodeValue">Loading...</div>
+            </div>
+            <button class="subtle-button" data-edit="host_code">Edit</button>
+          </div>
+
+          <div class="detail-row">
+            <div>
+              <span class="detail-label">Device</span>
+              <div class="detail-value mono" id="deviceNameValue">Loading...</div>
+            </div>
+          </div>
+
+          <div class="detail-row">
+            <div>
+              <span class="detail-label">Server</span>
+              <div class="detail-value mono" id="serverUrlValue">Loading...</div>
+            </div>
+            <button class="subtle-button" data-edit="server_url">Edit</button>
+          </div>
+
+          <div class="detail-row compact">
+            <div>
+              <span class="detail-label">Host ID</span>
+              <div class="detail-value mono small" id="hostIdValue">Loading...</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="status-line" id="waitingStatusLine">Preparing the host configuration...</div>
+      </div>
+    </section>
+
+    <section class="session-screen hidden" id="chatScreen">
+      <div class="session-header">
+        <div>
+          <span class="eyebrow">Client Connected</span>
+          <h1 id="sessionTitle">OmniPortal Chat</h1>
+          <p class="hero-copy" id="sessionSubtitle">A client is now paired with this host.</p>
+        </div>
+        <button class="secondary-button" id="leavePairButton">End Session</button>
+      </div>
+
+      <div class="status-line" id="sessionStatusLine">Negotiating the direct peer connection...</div>
+
+      <section class="chat-shell">
+        <div class="chat-log" id="chatLog">
+          <div class="chat-row system">Waiting for a client to connect.</div>
+        </div>
+        <div class="chat-compose">
+          <input id="chatInput" maxlength="400" placeholder="Type a message to the connected client" disabled>
+          <button class="primary-button" id="sendMessageButton" disabled>Send</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="overlay hidden" id="editOverlay">
+    <div class="overlay-backdrop" data-close-overlay="true"></div>
+    <div class="overlay-card">
+      <div class="overlay-header">
+        <div>
+          <span class="eyebrow">Edit Detail</span>
+          <h2 id="overlayTitle">Edit</h2>
+        </div>
+        <button class="subtle-button" id="overlayCloseButton">Close</button>
+      </div>
+      <p class="overlay-copy" id="overlayCopy"></p>
+      <div class="overlay-body" id="overlayBody"></div>
+      <div class="overlay-actions">
+        <button class="secondary-button" id="overlayCancelButton">Cancel</button>
+        <button class="primary-button" id="overlaySaveButton">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -25,11 +25,13 @@ function renderHosts(hosts) {
   }
   hostsList.innerHTML = hosts.map((host) => `
     <div class="item-card">
-      <strong>${host.host_name}</strong>
+      <strong>${host.display_name}</strong>
       <div class="tiny-note">Registered: ${formatTime(host.created_at)}</div>
-      <div class="tiny-note mono">${host.browser_id}</div>
+      ${host.device_name ? `<div class="tiny-note">${host.device_name}</div>` : ""}
+      <div class="tiny-note mono">${host.connect_id}</div>
       <div class="pill-row">
-        <span class="pill ok">Online</span>
+        ${host.host_code ? `<span class="pill host">Code ${host.host_code}</span>` : ""}
+        <span class="pill ${host.status === "connected" ? "client" : host.status === "connecting" ? "warn" : "ok"}">${host.status}</span>
         <span class="pill ${host.available ? "ok" : "warn"}">${host.available ? "Available" : "Busy"}</span>
       </div>
     </div>
@@ -48,7 +50,7 @@ function renderClients(clients) {
       <div class="tiny-note mono">${client.browser_id}</div>
       <div class="pill-row">
         <span class="pill client">${client.paired ? "Paired" : "Idle"}</span>
-        ${client.peer_host_name ? `<span class="pill host">${client.peer_host_name}</span>` : ""}
+        ${client.peer_display_name ? `<span class="pill host">${client.peer_display_name}</span>` : ""}
       </div>
     </div>
   `).join("");
@@ -61,11 +63,12 @@ function renderConnections(connections) {
   }
   connectionsList.innerHTML = connections.map((connection) => `
     <div class="item-card">
-      <strong>${connection.host_name}</strong>
+      <strong>${connection.host_display_name}</strong>
       <div class="tiny-note">Started: ${formatTime(connection.created_at)}</div>
-      <div class="tiny-note mono">Host: ${connection.host_browser_id}</div>
+      <div class="tiny-note mono">Host: ${connection.host_connect_id}</div>
       <div class="tiny-note mono">Client: ${connection.client_browser_id}</div>
       <div class="pill-row">
+        ${connection.host_code ? `<span class="pill host">Code ${connection.host_code}</span>` : ""}
         <span class="pill warn">${connection.state}</span>
       </div>
     </div>
@@ -81,11 +84,13 @@ function renderSessions(sessions) {
     <div class="item-card">
       <strong>${session.role.toUpperCase()}</strong>
       <div class="tiny-note">Updated: ${formatTime(session.updated_at)}</div>
-      <div class="tiny-note mono">${session.browser_id}</div>
+      <div class="tiny-note mono">${session.session_key}</div>
       <div class="pill-row">
         <span class="pill ${session.online ? "ok" : "warn"}">${session.online ? "Online" : "Offline"}</span>
         ${session.paired ? '<span class="pill client">Paired</span>' : ""}
-        ${session.host_name ? `<span class="pill host">${session.host_name}</span>` : ""}
+        ${session.display_name ? `<span class="pill host">${session.display_name}</span>` : ""}
+        ${session.host_code ? `<span class="pill host">Code ${session.host_code}</span>` : ""}
+        <span class="pill admin">${session.transport}</span>
       </div>
     </div>
   `).join("");

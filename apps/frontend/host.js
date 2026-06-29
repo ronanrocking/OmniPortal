@@ -94,7 +94,7 @@ function renderConnection() {
   connectionPanel.innerHTML = `
     <div class="item-card">
       <strong>Connected Client</strong>
-      <div class="tiny-note mono">${state.currentPair.peerBrowserId}</div>
+      <div class="tiny-note mono">${state.currentPair.peerId}</div>
       <div class="pill-row">
         <span class="pill client">${state.currentPair.peerRole.toUpperCase()}</span>
         <span class="pill ok">${state.peerState}</span>
@@ -209,7 +209,7 @@ function ensurePeerConnection() {
     logger.logEvent("webrtc", "Generated ICE candidate", event.candidate);
     state.socket.send(JSON.stringify({
       type: "signal",
-      target_browser_id: state.currentPair.peerBrowserId,
+      target_peer_id: state.currentPair.peerId,
       signal: {
         kind: "ice_candidate",
         candidate: event.candidate,
@@ -242,7 +242,8 @@ function ensurePeerConnection() {
 
 async function handleSignalMessage(payload) {
   logger.logEvent("signal", "Received signal", payload);
-  if (!state.currentPair || payload.from_browser_id !== state.currentPair.peerBrowserId) {
+  const fromPeerId = payload.from_peer_id || payload.from_browser_id;
+  if (!state.currentPair || fromPeerId !== state.currentPair.peerId) {
     logger.logEvent("signal", "Ignoring signal from non-current peer", payload);
     return;
   }
@@ -260,7 +261,7 @@ async function handleSignalMessage(payload) {
     await connection.setLocalDescription(answer);
     state.socket.send(JSON.stringify({
       type: "signal",
-      target_browser_id: state.currentPair.peerBrowserId,
+      target_peer_id: state.currentPair.peerId,
       signal: {
         kind: "answer",
         sdp: answer,
@@ -294,7 +295,7 @@ async function handlePairingStarted(payload) {
   resetChatLog("Client connected. Negotiating direct WebRTC channel.");
   state.currentPair = {
     pairId: payload.pair_id,
-    peerBrowserId: payload.peer_browser_id,
+    peerId: payload.peer_id || payload.peer_browser_id,
     peerRole: payload.peer_role,
   };
   state.peerState = "Signaling";

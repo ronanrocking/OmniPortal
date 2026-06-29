@@ -221,3 +221,5 @@ __marimo__/
 #personal
 docs/learning.md
 docs/private/*
+apps/host/node_modules/
+apps/host/dist/

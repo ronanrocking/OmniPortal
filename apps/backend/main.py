@@ -1,13 +1,14 @@
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -24,6 +25,14 @@ ROLE_HOST = "host"
 ROLE_CLIENT = "client"
 ALLOWED_ROLES = {ROLE_HOST, ROLE_CLIENT}
 
+HOST_TRANSPORT_BROWSER = "browser"
+HOST_TRANSPORT_INSTALLED = "installed_app"
+
+STATUS_OFFLINE = "offline"
+STATUS_ONLINE = "online"
+STATUS_CONNECTING = "connecting"
+STATUS_CONNECTED = "connected"
+
 SESSION_COOKIE = "omni_session_id"
 BROWSER_COOKIE = "omni_browser_id"
 
@@ -36,19 +45,32 @@ DEFAULT_STUN_SERVERS = [
     {"urls": ["stun:stun1.l.google.com:19302"]},
 ]
 
+HOST_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,80}$")
+HOST_CODE_PATTERN = re.compile(r"^\d{6}$")
+
 app = FastAPI()
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
 
-STATE_LOCK = Lock()
+STATE_LOCK = RLock()
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-ACTIVE_HOSTS: Dict[str, Dict[str, Any]] = {}
-LIVE_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
+BROWSER_HOSTS: Dict[str, Dict[str, Any]] = {}
+INSTALLED_HOSTS: Dict[str, Dict[str, Any]] = {}
+LIVE_CLIENT_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
+LIVE_BROWSER_HOST_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
+LIVE_INSTALLED_HOST_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
 PAIRINGS: Dict[str, Dict[str, Any]] = {}
 CLEANUP_TASK: Optional[asyncio.Task[Any]] = None
 
 
 class HostRegisterRequest(BaseModel):
     host_name: str = Field(..., min_length=1, max_length=50)
+
+
+class HostV1RegisterRequest(BaseModel):
+    host_id: str = Field(..., min_length=8, max_length=80)
+    host_code: str = Field(..., min_length=6, max_length=6)
+    display_name: str = Field(..., min_length=1, max_length=50)
+    device_name: Optional[str] = Field(None, max_length=100)
 
 
 def utc_now() -> datetime:
@@ -73,15 +95,6 @@ def iso_age_seconds(iso_value: Optional[str]) -> float:
     return max(0.0, (utc_now() - value).total_seconds())
 
 
-def normalize_host_name(host_name: str) -> str:
-    value = " ".join(host_name.strip().split())
-    if not value:
-        raise HTTPException(status_code=400, detail="host_name is required")
-    if len(value) > 50:
-        raise HTTPException(status_code=400, detail="host_name must be 50 characters or fewer")
-    return value
-
-
 def configured_stun_servers() -> List[Dict[str, Any]]:
     raw = os.getenv("OMNI_STUN_SERVERS", "").strip()
     if not raw:
@@ -93,6 +106,49 @@ def configured_stun_servers() -> List[Dict[str, Any]]:
         if url:
             servers.append({"urls": [url]})
     return servers or DEFAULT_STUN_SERVERS
+
+
+def normalize_host_name(host_name: str) -> str:
+    value = " ".join(host_name.strip().split())
+    if not value:
+        raise HTTPException(status_code=400, detail="host_name is required")
+    if len(value) > 50:
+        raise HTTPException(status_code=400, detail="host_name must be 50 characters or fewer")
+    return value
+
+
+def normalize_display_name(display_name: str) -> str:
+    value = " ".join(display_name.strip().split())
+    if not value:
+        raise HTTPException(status_code=400, detail="display_name is required")
+    if len(value) > 50:
+        raise HTTPException(status_code=400, detail="display_name must be 50 characters or fewer")
+    return value
+
+
+def normalize_device_name(device_name: Optional[str]) -> Optional[str]:
+    if device_name is None:
+        return None
+    value = " ".join(device_name.strip().split())
+    if not value:
+        return None
+    if len(value) > 100:
+        raise HTTPException(status_code=400, detail="device_name must be 100 characters or fewer")
+    return value
+
+
+def normalize_host_id(host_id: str) -> str:
+    value = host_id.strip()
+    if not HOST_ID_PATTERN.match(value):
+        raise HTTPException(status_code=400, detail="host_id must be 8-80 characters using letters, numbers, or hyphens")
+    return value
+
+
+def normalize_host_code(host_code: str) -> str:
+    value = host_code.strip()
+    if not HOST_CODE_PATTERN.match(value):
+        raise HTTPException(status_code=400, detail="host_code must be exactly 6 numeric digits")
+    return value
 
 
 def current_browser_id(request: Request) -> Optional[str]:
@@ -119,6 +175,20 @@ def set_identity_cookies(response: Response, browser_id: str, session_id: str) -
 def clear_identity_cookies(response: Response) -> None:
     response.delete_cookie(BROWSER_COOKIE, path="/")
     response.delete_cookie(SESSION_COOKIE, path="/")
+
+
+def browser_host_connect_id(browser_id: str) -> str:
+    return f"browser-host:{browser_id}"
+
+
+def installed_host_connect_id(host_id: str) -> str:
+    return f"host:{host_id}"
+
+
+def connect_id_for_host_record(host: Dict[str, Any]) -> str:
+    if host["transport"] == HOST_TRANSPORT_INSTALLED:
+        return installed_host_connect_id(host["host_id"])
+    return browser_host_connect_id(host["browser_id"])
 
 
 def current_session(browser_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -152,94 +222,129 @@ def upsert_session(browser_id: str, role: str, host_name: Optional[str] = None) 
 
 def clear_existing_host_for_browser(browser_id: str) -> None:
     with STATE_LOCK:
-        ACTIVE_HOSTS.pop(browser_id, None)
+        BROWSER_HOSTS.pop(browser_id, None)
 
 
-def register_host_state(browser_id: str, host_name: str, session_id: str) -> Dict[str, Any]:
+def register_browser_host_state(browser_id: str, host_name: str, session_id: str) -> Dict[str, Any]:
     now = utc_now_iso()
     with STATE_LOCK:
-        existing = ACTIVE_HOSTS.get(browser_id)
+        existing = BROWSER_HOSTS.get(browser_id)
         host = {
-            "host_id": session_id,
-            "session_id": session_id,
+            "host_id": f"legacy-browser-{session_id}",
             "browser_id": browser_id,
+            "display_name": host_name,
             "host_name": host_name,
+            "host_code": None,
+            "device_name": "Browser host",
+            "transport": HOST_TRANSPORT_BROWSER,
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
             "disconnected_at": None,
+            "last_online": existing["last_online"] if existing else None,
         }
-        ACTIVE_HOSTS[browser_id] = host
+        BROWSER_HOSTS[browser_id] = host
         return dict(host)
 
 
-def get_live_socket(browser_id: str) -> Optional[WebSocket]:
+def upsert_installed_host_state(payload: HostV1RegisterRequest) -> Dict[str, Any]:
+    host_id = normalize_host_id(payload.host_id)
+    host_code = normalize_host_code(payload.host_code)
+    display_name = normalize_display_name(payload.display_name)
+    device_name = normalize_device_name(payload.device_name)
+    now = utc_now_iso()
+
     with STATE_LOCK:
-        connection = LIVE_CONNECTIONS.get(browser_id)
-        return connection["websocket"] if connection else None
+        for existing_host_id, existing in INSTALLED_HOSTS.items():
+            if existing_host_id == host_id:
+                continue
+            if existing["host_code"] == host_code:
+                raise HTTPException(status_code=409, detail="host_code is already registered to another host")
+
+        existing = INSTALLED_HOSTS.get(host_id)
+        record = {
+            "host_id": host_id,
+            "display_name": display_name,
+            "host_code": host_code,
+            "device_name": device_name,
+            "transport": HOST_TRANSPORT_INSTALLED,
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+            "disconnected_at": existing["disconnected_at"] if existing else None,
+            "last_online": existing["last_online"] if existing else None,
+        }
+        INSTALLED_HOSTS[host_id] = record
+        return dict(record)
 
 
-def get_pairing(browser_id: str) -> Optional[Dict[str, Any]]:
+def get_host_record_by_connect_id(connect_id: str) -> Optional[Dict[str, Any]]:
     with STATE_LOCK:
-        pairing = PAIRINGS.get(browser_id)
-        return dict(pairing) if pairing else None
+        if connect_id.startswith("host:"):
+            host_id = connect_id.removeprefix("host:")
+            host = INSTALLED_HOSTS.get(host_id)
+            return dict(host) if host else None
+        if connect_id.startswith("browser-host:"):
+            browser_id = connect_id.removeprefix("browser-host:")
+            host = BROWSER_HOSTS.get(browser_id)
+            return dict(host) if host else None
+    return None
 
 
-def mark_connection_activity(browser_id: str) -> None:
-    now_iso = utc_now_iso()
-    now_monotonic = monotonic_now()
+def host_connection_for_record(host: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     with STATE_LOCK:
-        connection = LIVE_CONNECTIONS.get(browser_id)
-        if connection is not None:
-            connection["last_seen_at"] = now_iso
-            connection["last_seen_monotonic"] = now_monotonic
-        session = SESSIONS.get(browser_id)
-        if session is not None:
-            session["updated_at"] = now_iso
-            session["disconnected_at"] = None
-        host = ACTIVE_HOSTS.get(browser_id)
-        if host is not None:
-            host["updated_at"] = now_iso
-            host["disconnected_at"] = None
+        if host["transport"] == HOST_TRANSPORT_INSTALLED:
+            connection = LIVE_INSTALLED_HOST_CONNECTIONS.get(host["host_id"])
+        else:
+            connection = LIVE_BROWSER_HOST_CONNECTIONS.get(host["browser_id"])
+        return dict(connection) if connection else None
 
 
-def me_payload(browser_id: str) -> Dict[str, Any]:
-    session = current_session(browser_id)
-    if session is None or session["role"] not in ALLOWED_ROLES:
-        return {"session": None}
+def pairing_status_for_host(connect_id: str) -> Optional[str]:
+    with STATE_LOCK:
+        pairing = PAIRINGS.get(connect_id)
+        return pairing["state"] if pairing else None
 
-    payload = {
-        "session_id": session["session_id"],
-        "browser_id": browser_id,
-        "role": session["role"],
-        "online": browser_id in LIVE_CONNECTIONS,
-    }
-    if session["role"] == ROLE_HOST:
-        host = ACTIVE_HOSTS.get(browser_id)
-        if host is None:
-            return {"session": None}
-        payload["host_name"] = host["host_name"]
-    return {"session": payload}
+
+def public_host_status(host: Dict[str, Any]) -> str:
+    connection = host_connection_for_record(host)
+    if connection is None:
+        return STATUS_OFFLINE
+
+    pairing_state = pairing_status_for_host(connect_id_for_host_record(host))
+    if pairing_state in {"connected"}:
+        return STATUS_CONNECTED
+    if pairing_state in {"signaling", "connecting"}:
+        return STATUS_CONNECTING
+    return STATUS_ONLINE
 
 
 def host_payload(host: Dict[str, Any]) -> Dict[str, Any]:
-    browser_id = host["browser_id"]
-    live_connection = LIVE_CONNECTIONS.get(browser_id)
-    pairing = PAIRINGS.get(browser_id)
+    connect_id = connect_id_for_host_record(host)
+    connection = host_connection_for_record(host)
+    status_value = public_host_status(host)
     return {
         "host_id": host["host_id"],
-        "browser_id": browser_id,
-        "host_name": host["host_name"],
+        "connect_id": connect_id,
+        "browser_id": connect_id,
+        "display_name": host["display_name"],
+        "host_name": host["display_name"],
+        "host_code": host["host_code"],
+        "device_name": host["device_name"],
+        "transport": host["transport"],
         "created_at": host["created_at"],
         "updated_at": host["updated_at"],
-        "online": live_connection is not None,
-        "available": live_connection is not None and pairing is None,
-        "paired": pairing is not None,
+        "last_online": host["last_online"],
+        "online": connection is not None,
+        "available": connection is not None and PAIRINGS.get(connect_id) is None,
+        "paired": PAIRINGS.get(connect_id) is not None,
+        "status": status_value,
     }
 
 
 def connected_host_snapshot() -> List[Dict[str, Any]]:
     with STATE_LOCK:
-        hosts = [host_payload(host) for host in ACTIVE_HOSTS.values() if LIVE_CONNECTIONS.get(host["browser_id"]) is not None]
+        browser_hosts = [host_payload(host) for host in BROWSER_HOSTS.values() if LIVE_BROWSER_HOST_CONNECTIONS.get(host["browser_id"]) is not None]
+        installed_hosts = [host_payload(host) for host in INSTALLED_HOSTS.values() if LIVE_INSTALLED_HOST_CONNECTIONS.get(host["host_id"]) is not None]
+    hosts = browser_hosts + installed_hosts
     return sorted(hosts, key=lambda item: item["created_at"], reverse=True)
 
 
@@ -250,18 +355,16 @@ def connected_client_snapshot() -> List[Dict[str, Any]]:
             if session["role"] != ROLE_CLIENT:
                 continue
             browser_id = session["browser_id"]
-            live_connection = LIVE_CONNECTIONS.get(browser_id)
+            live_connection = LIVE_CLIENT_CONNECTIONS.get(browser_id)
             if live_connection is None:
                 continue
             pairing = PAIRINGS.get(browser_id)
-            host_name = None
-            pair_id = None
-            peer_browser_id = None
+            peer_display_name = None
+            peer_connect_id = None
             if pairing is not None:
-                pair_id = pairing["pair_id"]
-                peer_browser_id = pairing["host_browser_id"]
-                host = ACTIVE_HOSTS.get(peer_browser_id)
-                host_name = host["host_name"] if host else None
+                peer_connect_id = pairing["host_connect_id"]
+                host = get_host_record_by_connect_id(peer_connect_id)
+                peer_display_name = host["display_name"] if host else None
             clients.append(
                 {
                     "browser_id": browser_id,
@@ -269,9 +372,9 @@ def connected_client_snapshot() -> List[Dict[str, Any]]:
                     "connected_at": live_connection["connected_at"],
                     "updated_at": session["updated_at"],
                     "paired": pairing is not None,
-                    "pair_id": pair_id,
-                    "peer_browser_id": peer_browser_id,
-                    "peer_host_name": host_name,
+                    "pair_id": pairing["pair_id"] if pairing else None,
+                    "peer_connect_id": peer_connect_id,
+                    "peer_display_name": peer_display_name,
                 }
             )
     return sorted(clients, key=lambda item: item["connected_at"], reverse=True)
@@ -279,19 +382,20 @@ def connected_client_snapshot() -> List[Dict[str, Any]]:
 
 def active_connection_snapshot() -> List[Dict[str, Any]]:
     with STATE_LOCK:
-        connections = []
+        connections: List[Dict[str, Any]] = []
         seen_pair_ids = set()
         for pairing in PAIRINGS.values():
             pair_id = pairing["pair_id"]
             if pair_id in seen_pair_ids:
                 continue
             seen_pair_ids.add(pair_id)
-            host = ACTIVE_HOSTS.get(pairing["host_browser_id"])
+            host = get_host_record_by_connect_id(pairing["host_connect_id"])
             connections.append(
                 {
                     "pair_id": pair_id,
-                    "host_browser_id": pairing["host_browser_id"],
-                    "host_name": host["host_name"] if host else "Unknown host",
+                    "host_connect_id": pairing["host_connect_id"],
+                    "host_display_name": host["display_name"] if host else "Unknown host",
+                    "host_code": host["host_code"] if host else None,
                     "client_browser_id": pairing["client_browser_id"],
                     "state": pairing["state"],
                     "created_at": pairing["created_at"],
@@ -302,20 +406,38 @@ def active_connection_snapshot() -> List[Dict[str, Any]]:
 
 
 def active_session_snapshot() -> List[Dict[str, Any]]:
+    sessions: List[Dict[str, Any]] = []
     with STATE_LOCK:
-        sessions = []
         for session in SESSIONS.values():
             browser_id = session["browser_id"]
             pairing = PAIRINGS.get(browser_id)
             sessions.append(
                 {
-                    "browser_id": browser_id,
-                    "session_id": session["session_id"],
+                    "session_key": f"browser:{browser_id}",
                     "role": session["role"],
-                    "host_name": session.get("host_name"),
+                    "transport": HOST_TRANSPORT_BROWSER,
+                    "display_name": session.get("host_name"),
+                    "browser_id": browser_id,
                     "updated_at": session["updated_at"],
-                    "online": LIVE_CONNECTIONS.get(browser_id) is not None,
+                    "online": LIVE_CLIENT_CONNECTIONS.get(browser_id) is not None or LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id) is not None,
                     "disconnected_at": session.get("disconnected_at"),
+                    "paired": pairing is not None,
+                }
+            )
+
+        for host in INSTALLED_HOSTS.values():
+            pairing = PAIRINGS.get(installed_host_connect_id(host["host_id"]))
+            sessions.append(
+                {
+                    "session_key": f"host:{host['host_id']}",
+                    "role": ROLE_HOST,
+                    "transport": HOST_TRANSPORT_INSTALLED,
+                    "display_name": host["display_name"],
+                    "host_code": host["host_code"],
+                    "device_name": host["device_name"],
+                    "updated_at": host["updated_at"],
+                    "online": LIVE_INSTALLED_HOST_CONNECTIONS.get(host["host_id"]) is not None,
+                    "disconnected_at": host.get("disconnected_at"),
                     "paired": pairing is not None,
                 }
             )
@@ -323,8 +445,7 @@ def active_session_snapshot() -> List[Dict[str, Any]]:
 
 
 def list_client_visible_hosts() -> List[Dict[str, Any]]:
-    hosts = connected_host_snapshot()
-    return sorted(hosts, key=lambda item: item["created_at"], reverse=True)
+    return connected_host_snapshot()
 
 
 def admin_overview_payload() -> Dict[str, Any]:
@@ -346,54 +467,168 @@ def admin_overview_payload() -> Dict[str, Any]:
     }
 
 
-def get_peer_browser_id(browser_id: str) -> Optional[str]:
-    pairing = get_pairing(browser_id)
-    if pairing is None:
-        return None
-    if pairing["host_browser_id"] == browser_id:
-        return pairing["client_browser_id"]
-    return pairing["host_browser_id"]
+def me_payload(browser_id: str) -> Dict[str, Any]:
+    session = current_session(browser_id)
+    if session is None or session["role"] not in ALLOWED_ROLES:
+        return {"session": None}
+
+    online = False
+    host_name = None
+    if session["role"] == ROLE_CLIENT:
+        online = browser_id in LIVE_CLIENT_CONNECTIONS
+    else:
+        online = browser_id in LIVE_BROWSER_HOST_CONNECTIONS
+        host = BROWSER_HOSTS.get(browser_id)
+        if host is not None:
+            host_name = host["display_name"]
+
+    payload = {
+        "session_id": session["session_id"],
+        "browser_id": browser_id,
+        "role": session["role"],
+        "online": online,
+    }
+    if host_name:
+        payload["host_name"] = host_name
+    return {"session": payload}
 
 
-def validate_host_availability(host_browser_id: str) -> Tuple[bool, str]:
+def pairing_payload_for_client(pairing: Dict[str, Any]) -> Dict[str, Any]:
+    host = get_host_record_by_connect_id(pairing["host_connect_id"])
+    return {
+        "type": "pairing_started",
+        "pair_id": pairing["pair_id"],
+        "peer_id": pairing["host_connect_id"],
+        "peer_browser_id": pairing["host_connect_id"],
+        "peer_role": ROLE_HOST,
+        "peer_display_name": host["display_name"] if host else None,
+    }
+
+
+def pairing_payload_for_host(pairing: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "pairing_started",
+        "pair_id": pairing["pair_id"],
+        "peer_id": pairing["client_browser_id"],
+        "peer_browser_id": pairing["client_browser_id"],
+        "peer_role": ROLE_CLIENT,
+        "peer_display_name": "Client",
+    }
+
+
+def validate_host_availability(connect_id: str) -> Tuple[bool, str]:
+    host = get_host_record_by_connect_id(connect_id)
+    if host is None:
+        return False, "Selected host does not exist."
+    if host.get("transport") != HOST_TRANSPORT_INSTALLED:
+        return False, "Selected host is not a supported desktop host."
+    if host_connection_for_record(host) is None:
+        return False, "Selected host is offline."
     with STATE_LOCK:
-        host = ACTIVE_HOSTS.get(host_browser_id)
-        if host is None:
-            return False, "Selected host does not exist."
-        if LIVE_CONNECTIONS.get(host_browser_id) is None:
-            return False, "Selected host is offline."
-        if PAIRINGS.get(host_browser_id) is not None:
+        if PAIRINGS.get(connect_id) is not None:
             return False, "Selected host is already paired."
     return True, ""
 
 
-def create_pairing(host_browser_id: str, client_browser_id: str) -> Dict[str, Any]:
+def find_host_connect_id_by_code(host_code: str) -> Optional[str]:
+    normalized_code = normalize_host_code(host_code)
+    with STATE_LOCK:
+        for host in INSTALLED_HOSTS.values():
+            if host["host_code"] == normalized_code:
+                return installed_host_connect_id(host["host_id"])
+        for host in BROWSER_HOSTS.values():
+            if host.get("host_code") == normalized_code:
+                return browser_host_connect_id(host["browser_id"])
+    return None
+
+
+def create_pairing(host_connect_id: str, client_browser_id: str) -> Dict[str, Any]:
     now = utc_now_iso()
     pairing = {
         "pair_id": uuid4().hex,
-        "host_browser_id": host_browser_id,
+        "host_connect_id": host_connect_id,
         "client_browser_id": client_browser_id,
         "state": "signaling",
         "created_at": now,
         "updated_at": now,
     }
     with STATE_LOCK:
-        PAIRINGS[host_browser_id] = dict(pairing)
+        PAIRINGS[host_connect_id] = dict(pairing)
         PAIRINGS[client_browser_id] = dict(pairing)
     return pairing
 
 
-def clear_pairing_for_browser(browser_id: str) -> Optional[Dict[str, Any]]:
+def clear_pairing_for_peer(peer_id: str) -> Optional[Dict[str, Any]]:
     with STATE_LOCK:
-        pairing = PAIRINGS.get(browser_id)
+        pairing = PAIRINGS.get(peer_id)
         if pairing is None:
             return None
-        host_browser_id = pairing["host_browser_id"]
-        client_browser_id = pairing["client_browser_id"]
-        PAIRINGS.pop(host_browser_id, None)
-        PAIRINGS.pop(client_browser_id, None)
+        PAIRINGS.pop(pairing["host_connect_id"], None)
+        PAIRINGS.pop(pairing["client_browser_id"], None)
         pairing["updated_at"] = utc_now_iso()
         return dict(pairing)
+
+
+def get_live_socket_for_peer(peer_id: str) -> Optional[WebSocket]:
+    with STATE_LOCK:
+        if peer_id.startswith("host:"):
+            host_id = peer_id.removeprefix("host:")
+            connection = LIVE_INSTALLED_HOST_CONNECTIONS.get(host_id)
+        elif peer_id.startswith("browser-host:"):
+            browser_id = peer_id.removeprefix("browser-host:")
+            connection = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
+        else:
+            connection = LIVE_CLIENT_CONNECTIONS.get(peer_id)
+        return connection["websocket"] if connection else None
+
+
+def all_live_websockets() -> List[WebSocket]:
+    with STATE_LOCK:
+        sockets = [item["websocket"] for item in LIVE_CLIENT_CONNECTIONS.values()]
+        sockets.extend(item["websocket"] for item in LIVE_BROWSER_HOST_CONNECTIONS.values())
+        sockets.extend(item["websocket"] for item in LIVE_INSTALLED_HOST_CONNECTIONS.values())
+    return sockets
+
+
+def mark_browser_connection_activity(browser_id: str, role: str) -> None:
+    now_iso = utc_now_iso()
+    now_monotonic = monotonic_now()
+    with STATE_LOCK:
+        if role == ROLE_CLIENT:
+            connection = LIVE_CLIENT_CONNECTIONS.get(browser_id)
+        else:
+            connection = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
+        if connection is not None:
+            connection["last_seen_at"] = now_iso
+            connection["last_seen_monotonic"] = now_monotonic
+
+        session = SESSIONS.get(browser_id)
+        if session is not None:
+            session["updated_at"] = now_iso
+            session["disconnected_at"] = None
+
+        if role == ROLE_HOST:
+            host = BROWSER_HOSTS.get(browser_id)
+            if host is not None:
+                host["updated_at"] = now_iso
+                host["disconnected_at"] = None
+                host["last_online"] = now_iso
+
+
+def mark_installed_host_activity(host_id: str) -> None:
+    now_iso = utc_now_iso()
+    now_monotonic = monotonic_now()
+    with STATE_LOCK:
+        connection = LIVE_INSTALLED_HOST_CONNECTIONS.get(host_id)
+        if connection is not None:
+            connection["last_seen_at"] = now_iso
+            connection["last_seen_monotonic"] = now_monotonic
+
+        host = INSTALLED_HOSTS.get(host_id)
+        if host is not None:
+            host["updated_at"] = now_iso
+            host["disconnected_at"] = None
+            host["last_online"] = now_iso
 
 
 async def send_json_safe(websocket: Optional[WebSocket], payload: Dict[str, Any]) -> None:
@@ -415,11 +650,8 @@ async def close_socket_safe(websocket: Optional[WebSocket], code: int, reason: s
 
 
 async def send_hosts_snapshot() -> None:
-    hosts = list_client_visible_hosts()
-    with STATE_LOCK:
-        targets = [connection["websocket"] for connection in LIVE_CONNECTIONS.values()]
-    payload = {"type": "hosts_snapshot", "hosts": hosts}
-    for websocket in targets:
+    payload = {"type": "hosts_snapshot", "hosts": list_client_visible_hosts()}
+    for websocket in all_live_websockets():
         await send_json_safe(websocket, payload)
 
 
@@ -427,8 +659,8 @@ async def broadcast_system_state() -> None:
     await send_hosts_snapshot()
 
 
-async def clear_pairing_and_notify(browser_id: str, reason: str, initiator: Optional[str] = None) -> None:
-    pairing = clear_pairing_for_browser(browser_id)
+async def clear_pairing_and_notify(peer_id: str, reason: str, initiator: Optional[str] = None) -> None:
+    pairing = clear_pairing_for_peer(peer_id)
     if pairing is None:
         return
 
@@ -438,110 +670,201 @@ async def clear_pairing_and_notify(browser_id: str, reason: str, initiator: Opti
         "pair_id": pairing["pair_id"],
         "initiator": initiator,
     }
-    await send_json_safe(get_live_socket(pairing["host_browser_id"]), payload)
-    await send_json_safe(get_live_socket(pairing["client_browser_id"]), payload)
+    await send_json_safe(get_live_socket_for_peer(pairing["host_connect_id"]), payload)
+    await send_json_safe(get_live_socket_for_peer(pairing["client_browser_id"]), payload)
     await broadcast_system_state()
 
 
-async def mark_pairing_state(browser_id: str, state: str) -> None:
+async def mark_pairing_state(peer_id: str, state_value: str) -> None:
     with STATE_LOCK:
-        pairing = PAIRINGS.get(browser_id)
+        pairing = PAIRINGS.get(peer_id)
         if pairing is None:
             return
         now = utc_now_iso()
-        for peer_browser_id in (pairing["host_browser_id"], pairing["client_browser_id"]):
-            PAIRINGS[peer_browser_id]["state"] = state
-            PAIRINGS[peer_browser_id]["updated_at"] = now
+        for participant in (pairing["host_connect_id"], pairing["client_browser_id"]):
+            PAIRINGS[participant]["state"] = state_value
+            PAIRINGS[participant]["updated_at"] = now
+    await broadcast_system_state()
 
 
-async def connect_websocket(browser_id: str, websocket: WebSocket) -> None:
+async def connect_browser_websocket(browser_id: str, role: str, websocket: WebSocket) -> None:
     previous_socket = None
-    role = None
     now_iso = utc_now_iso()
     now_monotonic = monotonic_now()
+
     with STATE_LOCK:
+        if role == ROLE_CLIENT:
+            existing = LIVE_CLIENT_CONNECTIONS.get(browser_id)
+            if existing is not None:
+                previous_socket = existing["websocket"]
+            LIVE_CLIENT_CONNECTIONS[browser_id] = {
+                "websocket": websocket,
+                "role": role,
+                "connected_at": now_iso,
+                "last_seen_at": now_iso,
+                "last_seen_monotonic": now_monotonic,
+            }
+        else:
+            existing = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
+            if existing is not None:
+                previous_socket = existing["websocket"]
+            LIVE_BROWSER_HOST_CONNECTIONS[browser_id] = {
+                "websocket": websocket,
+                "role": role,
+                "connected_at": now_iso,
+                "last_seen_at": now_iso,
+                "last_seen_monotonic": now_monotonic,
+            }
+            host = BROWSER_HOSTS.get(browser_id)
+            if host is not None:
+                host["updated_at"] = now_iso
+                host["disconnected_at"] = None
+                host["last_online"] = now_iso
+
         session = SESSIONS.get(browser_id)
-        if session is not None:
-            role = session["role"]
-        existing = LIVE_CONNECTIONS.get(browser_id)
-        if existing is not None:
-            previous_socket = existing["websocket"]
-        LIVE_CONNECTIONS[browser_id] = {
-            "websocket": websocket,
-            "role": role,
-            "connected_at": now_iso,
-            "last_seen_at": now_iso,
-            "last_seen_monotonic": now_monotonic,
-        }
         if session is not None:
             session["updated_at"] = now_iso
             session["disconnected_at"] = None
-        host = ACTIVE_HOSTS.get(browser_id)
-        if host is not None:
-            host["updated_at"] = now_iso
-            host["disconnected_at"] = None
+
     await close_socket_safe(previous_socket, 4000, "Superseded by a newer connection.")
     await broadcast_system_state()
 
 
-async def expire_browser_connection(browser_id: str, reason: str, websocket: Optional[WebSocket] = None) -> None:
-    socket_to_close = None
+async def connect_installed_host_websocket(host_id: str, websocket: WebSocket) -> None:
+    previous_socket = None
     now_iso = utc_now_iso()
+    now_monotonic = monotonic_now()
+
     with STATE_LOCK:
-        existing = LIVE_CONNECTIONS.get(browser_id)
-        if existing is None:
-            return
-        if websocket is not None and existing["websocket"] is not websocket:
-            return
-        socket_to_close = existing["websocket"]
-        LIVE_CONNECTIONS.pop(browser_id, None)
+        existing = LIVE_INSTALLED_HOST_CONNECTIONS.get(host_id)
+        if existing is not None:
+            previous_socket = existing["websocket"]
+        LIVE_INSTALLED_HOST_CONNECTIONS[host_id] = {
+            "websocket": websocket,
+            "role": ROLE_HOST,
+            "connected_at": now_iso,
+            "last_seen_at": now_iso,
+            "last_seen_monotonic": now_monotonic,
+        }
+        host = INSTALLED_HOSTS.get(host_id)
+        if host is not None:
+            host["updated_at"] = now_iso
+            host["disconnected_at"] = None
+            host["last_online"] = now_iso
+
+    await close_socket_safe(previous_socket, 4000, "Superseded by a newer connection.")
+    await broadcast_system_state()
+
+
+async def expire_browser_connection(browser_id: str, reason: str, role: Optional[str] = None, websocket: Optional[WebSocket] = None) -> None:
+    socket_to_close = None
+    resolved_role = role
+    now_iso = utc_now_iso()
+
+    with STATE_LOCK:
+        if resolved_role is None:
+            if browser_id in LIVE_CLIENT_CONNECTIONS:
+                resolved_role = ROLE_CLIENT
+            elif browser_id in LIVE_BROWSER_HOST_CONNECTIONS:
+                resolved_role = ROLE_HOST
+
+        if resolved_role == ROLE_CLIENT:
+            existing = LIVE_CLIENT_CONNECTIONS.get(browser_id)
+            if existing is None:
+                return
+            if websocket is not None and existing["websocket"] is not websocket:
+                return
+            socket_to_close = existing["websocket"]
+            LIVE_CLIENT_CONNECTIONS.pop(browser_id, None)
+        else:
+            existing = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
+            if existing is None:
+                return
+            if websocket is not None and existing["websocket"] is not websocket:
+                return
+            socket_to_close = existing["websocket"]
+            LIVE_BROWSER_HOST_CONNECTIONS.pop(browser_id, None)
+            host = BROWSER_HOSTS.get(browser_id)
+            if host is not None:
+                host["updated_at"] = now_iso
+                host["disconnected_at"] = now_iso
+
         session = SESSIONS.get(browser_id)
         if session is not None:
             session["updated_at"] = now_iso
             session["disconnected_at"] = now_iso
-        host = ACTIVE_HOSTS.get(browser_id)
-        if host is not None:
-            host["updated_at"] = now_iso
-            host["disconnected_at"] = now_iso
 
-    await clear_pairing_and_notify(browser_id, reason, initiator=browser_id)
+    participant_id = browser_id if resolved_role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+    await clear_pairing_and_notify(participant_id, reason, initiator=participant_id)
     if websocket is None:
         await close_socket_safe(socket_to_close, 4001, reason)
     await broadcast_system_state()
 
 
-async def disconnect_websocket(browser_id: str, websocket: WebSocket) -> None:
-    await expire_browser_connection(browser_id, "peer_disconnected", websocket=websocket)
+async def expire_installed_host_connection(host_id: str, reason: str, websocket: Optional[WebSocket] = None) -> None:
+    socket_to_close = None
+    now_iso = utc_now_iso()
+
+    with STATE_LOCK:
+        existing = LIVE_INSTALLED_HOST_CONNECTIONS.get(host_id)
+        if existing is None:
+            return
+        if websocket is not None and existing["websocket"] is not websocket:
+            return
+        socket_to_close = existing["websocket"]
+        LIVE_INSTALLED_HOST_CONNECTIONS.pop(host_id, None)
+        host = INSTALLED_HOSTS.get(host_id)
+        if host is not None:
+            host["updated_at"] = now_iso
+            host["disconnected_at"] = now_iso
+
+    participant_id = installed_host_connect_id(host_id)
+    await clear_pairing_and_notify(participant_id, reason, initiator=participant_id)
+    if websocket is None:
+        await close_socket_safe(socket_to_close, 4001, reason)
+    await broadcast_system_state()
 
 
 async def cleanup_stale_state() -> None:
-    stale_connections: List[str] = []
+    stale_clients: List[str] = []
+    stale_browser_hosts: List[str] = []
+    stale_installed_hosts: List[str] = []
     stale_sessions: List[str] = []
     now_monotonic = monotonic_now()
 
     with STATE_LOCK:
-        for browser_id, connection in LIVE_CONNECTIONS.items():
-            age = now_monotonic - connection["last_seen_monotonic"]
-            if age > HEARTBEAT_TIMEOUT_SECONDS:
-                stale_connections.append(browser_id)
+        for browser_id, connection in LIVE_CLIENT_CONNECTIONS.items():
+            if now_monotonic - connection["last_seen_monotonic"] > HEARTBEAT_TIMEOUT_SECONDS:
+                stale_clients.append(browser_id)
+
+        for browser_id, connection in LIVE_BROWSER_HOST_CONNECTIONS.items():
+            if now_monotonic - connection["last_seen_monotonic"] > HEARTBEAT_TIMEOUT_SECONDS:
+                stale_browser_hosts.append(browser_id)
+
+        for host_id, connection in LIVE_INSTALLED_HOST_CONNECTIONS.items():
+            if now_monotonic - connection["last_seen_monotonic"] > HEARTBEAT_TIMEOUT_SECONDS:
+                stale_installed_hosts.append(host_id)
 
         for browser_id, session in SESSIONS.items():
-            if LIVE_CONNECTIONS.get(browser_id) is not None:
+            if browser_id in LIVE_CLIENT_CONNECTIONS or browser_id in LIVE_BROWSER_HOST_CONNECTIONS:
                 continue
             disconnected_at = session.get("disconnected_at")
             if disconnected_at and iso_age_seconds(disconnected_at) > DISCONNECTED_SESSION_GRACE_SECONDS:
                 stale_sessions.append(browser_id)
 
-    for browser_id in stale_connections:
-        await expire_browser_connection(browser_id, "heartbeat_timeout")
+    for browser_id in stale_clients:
+        await expire_browser_connection(browser_id, "heartbeat_timeout", role=ROLE_CLIENT)
+    for browser_id in stale_browser_hosts:
+        await expire_browser_connection(browser_id, "heartbeat_timeout", role=ROLE_HOST)
+    for host_id in stale_installed_hosts:
+        await expire_installed_host_connection(host_id, "heartbeat_timeout")
 
     if stale_sessions:
         with STATE_LOCK:
             for browser_id in stale_sessions:
-                pairing = PAIRINGS.get(browser_id)
-                if pairing is not None:
+                if PAIRINGS.get(browser_id) is not None:
                     continue
-                ACTIVE_HOSTS.pop(browser_id, None)
+                BROWSER_HOSTS.pop(browser_id, None)
                 SESSIONS.pop(browser_id, None)
 
 
@@ -588,8 +911,51 @@ def root(request: Request) -> HTMLResponse:
 
 
 @app.get("/host", response_class=HTMLResponse)
-def host_page(request: Request) -> HTMLResponse:
-    return serve_page(HOST_HTML_PATH, browser_id=ensure_browser_id(request))
+def host_page() -> HTMLResponse:
+    return HTMLResponse(
+        """
+        <!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>OmniPortal Host Moved</title>
+          <style>
+            body {
+              margin: 0;
+              min-height: 100vh;
+              display: grid;
+              place-items: center;
+              font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+              background: linear-gradient(180deg, #f8f2e8 0%, #ece3d6 100%);
+              color: #2c2219;
+            }
+            main {
+              max-width: 680px;
+              margin: 24px;
+              padding: 28px;
+              border-radius: 24px;
+              background: rgba(255, 252, 245, 0.94);
+              border: 1px solid rgba(84, 58, 20, 0.14);
+              box-shadow: 0 24px 64px rgba(59, 37, 15, 0.12);
+            }
+            a {
+              color: #115e59;
+              font-weight: 700;
+            }
+          </style>
+        </head>
+        <body>
+          <main>
+            <h1>Browser hosting has moved</h1>
+            <p>The browser host page is no longer active. Hosts now run through the installed OmniPortal Host desktop app.</p>
+            <p><a href="/client">Open the client page</a> or <a href="/admin">open the admin dashboard</a>.</p>
+          </main>
+        </body>
+        </html>
+        """,
+        status_code=410,
+    )
 
 
 @app.get("/client", response_class=HTMLResponse)
@@ -613,12 +979,14 @@ def legacy_app_js() -> FileResponse:
 def get_status() -> Dict[str, Any]:
     with STATE_LOCK:
         pair_ids = {pairing["pair_id"] for pairing in PAIRINGS.values()}
-        return {
-            "status": "ok",
-            "live_connections": len(LIVE_CONNECTIONS),
-            "active_hosts": len(ACTIVE_HOSTS),
-            "active_pairs": len(pair_ids),
-        }
+        live_connections = len(LIVE_CLIENT_CONNECTIONS) + len(LIVE_BROWSER_HOST_CONNECTIONS) + len(LIVE_INSTALLED_HOST_CONNECTIONS)
+        active_hosts = len(connected_host_snapshot())
+    return {
+        "status": "ok",
+        "live_connections": live_connections,
+        "active_hosts": active_hosts,
+        "active_pairs": len(pair_ids),
+    }
 
 
 @app.get("/api/config")
@@ -645,15 +1013,17 @@ def admin_overview() -> Dict[str, Any]:
 
 @app.post("/api/host/register")
 async def register_host(payload: HostRegisterRequest, request: Request, response: Response) -> Dict[str, Any]:
-    browser_id = ensure_browser_id(request)
-    host_name = normalize_host_name(payload.host_name)
+    raise HTTPException(
+        status_code=410,
+        detail="Browser hosting has been retired. Use the installed OmniPortal Host desktop app instead.",
+    )
 
-    await clear_pairing_and_notify(browser_id, "role_changed", initiator=browser_id)
-    session = upsert_session(browser_id, ROLE_HOST, host_name)
-    host = register_host_state(browser_id, host_name, session["session_id"])
-    set_identity_cookies(response, browser_id, session["session_id"])
+
+@app.post("/api/host-v1/register")
+async def register_host_v1(payload: HostV1RegisterRequest) -> Dict[str, Any]:
+    host = upsert_installed_host_state(payload)
     await broadcast_system_state()
-    return {"session": session, "host": host_payload(host)}
+    return {"host": host_payload(host)}
 
 
 @app.post("/api/client/join")
@@ -661,7 +1031,10 @@ async def join_client(request: Request, response: Response) -> Dict[str, Any]:
     browser_id = ensure_browser_id(request)
 
     await clear_pairing_and_notify(browser_id, "role_changed", initiator=browser_id)
+    await clear_pairing_and_notify(browser_host_connect_id(browser_id), "role_changed", initiator=browser_host_connect_id(browser_id))
+    await expire_browser_connection(browser_id, "role_changed")
     clear_existing_host_for_browser(browser_id)
+
     session = upsert_session(browser_id, ROLE_CLIENT)
     set_identity_cookies(response, browser_id, session["session_id"])
     await broadcast_system_state()
@@ -673,9 +1046,10 @@ async def reset_session(request: Request, response: Response) -> Dict[str, Any]:
     browser_id = ensure_browser_id(request)
 
     await clear_pairing_and_notify(browser_id, "session_reset", initiator=browser_id)
+    await clear_pairing_and_notify(browser_host_connect_id(browser_id), "session_reset", initiator=browser_host_connect_id(browser_id))
     await expire_browser_connection(browser_id, "session_reset")
     with STATE_LOCK:
-        ACTIVE_HOSTS.pop(browser_id, None)
+        BROWSER_HOSTS.pop(browser_id, None)
         SESSIONS.pop(browser_id, None)
     clear_identity_cookies(response)
     await broadcast_system_state()
@@ -694,14 +1068,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="A host or client session is required.")
         return
 
+    role = session["role"]
+    if role == ROLE_HOST:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Browser hosting has been retired.")
+        return
+
     await websocket.accept()
-    await connect_websocket(browser_id, websocket)
+    await connect_browser_websocket(browser_id, role, websocket)
 
     session = current_session(browser_id)
     await send_json_safe(
         websocket,
         {
             "type": "welcome",
+            "peer_id": browser_host_connect_id(browser_id) if role == ROLE_HOST else browser_id,
             "browser_id": browser_id,
             "role": session["role"] if session else None,
             "session_id": session["session_id"] if session else None,
@@ -712,10 +1092,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     try:
         while True:
             payload = await websocket.receive_json()
-            mark_connection_activity(browser_id)
+            mark_browser_connection_activity(browser_id, role)
             message_type = payload.get("type")
-            session = current_session(browser_id)
-            role = session["role"] if session else None
 
             if message_type == "heartbeat":
                 continue
@@ -725,53 +1103,68 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_json_safe(websocket, {"type": "error", "message": "Only clients can connect to hosts."})
                     continue
 
-                host_browser_id = payload.get("host_browser_id")
-                if not isinstance(host_browser_id, str) or not host_browser_id:
-                    await send_json_safe(websocket, {"type": "error", "message": "A valid host identifier is required."})
+                connect_id = payload.get("connect_id")
+                legacy_host_browser_id = payload.get("host_browser_id")
+                requested_host_code = payload.get("host_code")
+                if isinstance(connect_id, str):
+                    connect_id = connect_id.strip()
+                else:
+                    connect_id = None
+                if not connect_id and isinstance(legacy_host_browser_id, str):
+                    connect_id = legacy_host_browser_id.strip()
+                if not connect_id and isinstance(requested_host_code, str) and requested_host_code.strip():
+                    try:
+                        connect_id = find_host_connect_id_by_code(requested_host_code.strip())
+                    except HTTPException:
+                        connect_id = None
+                if not isinstance(requested_host_code, str) or not requested_host_code.strip():
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit host PIN is required."})
                     continue
-                if host_browser_id == browser_id:
-                    await send_json_safe(websocket, {"type": "error", "message": "A client cannot connect to itself."})
+                try:
+                    normalized_requested_code = normalize_host_code(requested_host_code.strip())
+                except HTTPException:
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit host PIN is required."})
+                    continue
+                if not isinstance(connect_id, str) or not connect_id:
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid host identifier is required."})
                     continue
 
                 await clear_pairing_and_notify(browser_id, "replaced_by_new_pair", initiator=browser_id)
-                is_available, error_message = validate_host_availability(host_browser_id)
+                is_available, error_message = validate_host_availability(connect_id)
                 if not is_available:
                     await send_json_safe(websocket, {"type": "error", "message": error_message})
                     await send_json_safe(websocket, {"type": "hosts_snapshot", "hosts": list_client_visible_hosts()})
                     continue
 
-                pairing = create_pairing(host_browser_id, browser_id)
-                host_socket = get_live_socket(host_browser_id)
+                host = get_host_record_by_connect_id(connect_id)
+                if host is None:
+                    await send_json_safe(websocket, {"type": "error", "message": "Selected host does not exist."})
+                    continue
+
+                if host.get("host_code") != normalized_requested_code:
+                    await send_json_safe(websocket, {"type": "error", "message": "The host PIN did not match the selected host."})
+                    continue
+
+                pairing = create_pairing(connect_id, browser_id)
+                host_socket = get_live_socket_for_peer(connect_id)
                 if host_socket is None:
-                    await clear_pairing_and_notify(browser_id, "host_went_offline", initiator=host_browser_id)
+                    await clear_pairing_and_notify(browser_id, "host_went_offline", initiator=connect_id)
                     await send_json_safe(websocket, {"type": "error", "message": "Selected host went offline."})
                     continue
 
-                await send_json_safe(
-                    websocket,
-                    {
-                        "type": "pairing_started",
-                        "pair_id": pairing["pair_id"],
-                        "peer_browser_id": host_browser_id,
-                        "peer_role": ROLE_HOST,
-                        "initiator": True,
-                    },
-                )
-                await send_json_safe(
-                    host_socket,
-                    {
-                        "type": "pairing_started",
-                        "pair_id": pairing["pair_id"],
-                        "peer_browser_id": browser_id,
-                        "peer_role": ROLE_CLIENT,
-                        "initiator": False,
-                    },
-                )
+                client_payload = pairing_payload_for_client(pairing)
+                client_payload["initiator"] = True
+                host_payload_data = pairing_payload_for_host(pairing)
+                host_payload_data["initiator"] = False
+
+                await send_json_safe(websocket, client_payload)
+                await send_json_safe(host_socket, host_payload_data)
                 await broadcast_system_state()
                 continue
 
             if message_type == "leave_pair":
-                await clear_pairing_and_notify(browser_id, "left_by_user", initiator=browser_id)
+                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                await clear_pairing_and_notify(participant_id, "left_by_user", initiator=participant_id)
                 continue
 
             if message_type == "rtc_state":
@@ -779,34 +1172,43 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if not isinstance(state_value, str) or not state_value:
                     await send_json_safe(websocket, {"type": "error", "message": "A valid RTC state is required."})
                     continue
-                await mark_pairing_state(browser_id, state_value)
+                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                await mark_pairing_state(participant_id, state_value)
                 continue
 
             if message_type == "signal":
                 signal = payload.get("signal")
-                target_browser_id = payload.get("target_browser_id")
+                target_peer_id = payload.get("target_peer_id")
                 if not isinstance(signal, dict):
                     await send_json_safe(websocket, {"type": "error", "message": "Signal payload is required."})
                     continue
-                if not isinstance(target_browser_id, str) or not target_browser_id:
+                if not isinstance(target_peer_id, str) or not target_peer_id:
                     await send_json_safe(websocket, {"type": "error", "message": "Signal target is required."})
                     continue
 
-                peer_browser_id = get_peer_browser_id(browser_id)
-                if peer_browser_id is None or peer_browser_id != target_browser_id:
+                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                with STATE_LOCK:
+                    pairing = PAIRINGS.get(participant_id)
+                if pairing is None:
+                    await send_json_safe(websocket, {"type": "error", "message": "No active peer is available for signaling."})
+                    continue
+
+                expected_peer_id = pairing["host_connect_id"] if role == ROLE_CLIENT else pairing["client_browser_id"]
+                if expected_peer_id != target_peer_id:
                     await send_json_safe(websocket, {"type": "error", "message": "Signal target is not the current peer."})
                     continue
 
-                target_socket = get_live_socket(target_browser_id)
+                target_socket = get_live_socket_for_peer(target_peer_id)
                 if target_socket is None:
-                    await clear_pairing_and_notify(browser_id, "peer_disconnected", initiator=target_browser_id)
+                    await clear_pairing_and_notify(participant_id, "peer_disconnected", initiator=target_peer_id)
                     continue
 
                 await send_json_safe(
                     target_socket,
                     {
                         "type": "signal",
-                        "from_browser_id": browser_id,
+                        "from_peer_id": participant_id,
+                        "from_browser_id": participant_id,
                         "signal": signal,
                     },
                 )
@@ -816,4 +1218,88 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        await disconnect_websocket(browser_id, websocket)
+        await expire_browser_connection(browser_id, "peer_disconnected", role=role, websocket=websocket)
+
+
+@app.websocket("/ws/host-v1")
+async def host_v1_websocket_endpoint(websocket: WebSocket, host_id: str = Query(...)) -> None:
+    normalized_host_id = normalize_host_id(host_id)
+    with STATE_LOCK:
+        host = INSTALLED_HOSTS.get(normalized_host_id)
+    if host is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Host must register before opening the socket.")
+        return
+
+    await websocket.accept()
+    await connect_installed_host_websocket(normalized_host_id, websocket)
+    await send_json_safe(
+        websocket,
+        {
+            "type": "welcome",
+            "peer_id": installed_host_connect_id(normalized_host_id),
+            "role": ROLE_HOST,
+            "host_id": normalized_host_id,
+            "host_code": host["host_code"],
+        },
+    )
+
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            mark_installed_host_activity(normalized_host_id)
+            message_type = payload.get("type")
+
+            if message_type == "heartbeat":
+                continue
+
+            if message_type == "leave_pair":
+                participant_id = installed_host_connect_id(normalized_host_id)
+                await clear_pairing_and_notify(participant_id, "left_by_user", initiator=participant_id)
+                continue
+
+            if message_type == "rtc_state":
+                state_value = payload.get("state")
+                if not isinstance(state_value, str) or not state_value:
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid RTC state is required."})
+                    continue
+                await mark_pairing_state(installed_host_connect_id(normalized_host_id), state_value)
+                continue
+
+            if message_type == "signal":
+                signal = payload.get("signal")
+                target_peer_id = payload.get("target_peer_id")
+                if not isinstance(signal, dict):
+                    await send_json_safe(websocket, {"type": "error", "message": "Signal payload is required."})
+                    continue
+                if not isinstance(target_peer_id, str) or not target_peer_id:
+                    await send_json_safe(websocket, {"type": "error", "message": "Signal target is required."})
+                    continue
+
+                participant_id = installed_host_connect_id(normalized_host_id)
+                with STATE_LOCK:
+                    pairing = PAIRINGS.get(participant_id)
+                if pairing is None or pairing["client_browser_id"] != target_peer_id:
+                    await send_json_safe(websocket, {"type": "error", "message": "Signal target is not the current peer."})
+                    continue
+
+                target_socket = get_live_socket_for_peer(target_peer_id)
+                if target_socket is None:
+                    await clear_pairing_and_notify(participant_id, "peer_disconnected", initiator=target_peer_id)
+                    continue
+
+                await send_json_safe(
+                    target_socket,
+                    {
+                        "type": "signal",
+                        "from_peer_id": participant_id,
+                        "from_browser_id": participant_id,
+                        "signal": signal,
+                    },
+                )
+                continue
+
+            await send_json_safe(websocket, {"type": "error", "message": "Unsupported message type."})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await expire_installed_host_connection(normalized_host_id, "peer_disconnected", websocket=websocket)

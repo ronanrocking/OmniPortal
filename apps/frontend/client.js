@@ -1,4 +1,4 @@
-import { createLogger, fetchJson, formatTime, setStatus, socketUrl, startHeartbeat, stopHeartbeat } from "/frontend/shared.js";
+import { createLogger, fetchJson, setStatus, socketUrl, startHeartbeat, stopHeartbeat } from "/frontend/shared.js";
 
 const logger = createLogger("OmniPortalClient");
 const state = {
@@ -13,45 +13,80 @@ const state = {
   chatReady: false,
   peerConnection: null,
   dataChannel: null,
+  reconnectTimer: null,
+  reconnectDelayMs: 2000,
+  autoConnectEnabled: true,
+  pendingPin: "",
+  awaitingPairing: false,
 };
 
-const currentRoleMetric = document.getElementById("currentRoleMetric");
-const socketMetric = document.getElementById("socketMetric");
-const peerMetric = document.getElementById("peerMetric");
+const connectScreen = document.getElementById("connectScreen");
+const chatScreen = document.getElementById("chatScreen");
 const statusBox = document.getElementById("statusBox");
-const joinClientButton = document.getElementById("joinClientButton");
-const refreshHostsButton = document.getElementById("refreshHostsButton");
-const resetSessionButton = document.getElementById("resetSessionButton");
-const mePanel = document.getElementById("mePanel");
-const hostList = document.getElementById("hostList");
-const connectionPanel = document.getElementById("connectionPanel");
+const sessionStatusBox = document.getElementById("sessionStatusBox");
+const sessionTitle = document.getElementById("sessionTitle");
+const sessionSubtitle = document.getElementById("sessionSubtitle");
+const hostCodeInput = document.getElementById("hostCodeInput");
 const leavePairButton = document.getElementById("leavePairButton");
-const chatCaption = document.getElementById("chatCaption");
 const chatLog = document.getElementById("chatLog");
 const chatInput = document.getElementById("chatInput");
 const sendMessageButton = document.getElementById("sendMessageButton");
 
-function renderMetrics() {
-  currentRoleMetric.textContent = state.me?.session?.role ? state.me.session.role.toUpperCase() : "Not a client";
-  socketMetric.textContent = state.socketReady ? "Connected" : "Disconnected";
-  peerMetric.textContent = state.peerState;
-  leavePairButton.classList.toggle("hidden", !state.currentPair);
+function normalizeHost(host) {
+  const hostId = host.host_id || host.hostId || null;
+  const connectId = host.connect_id || host.connectId || host.browser_id || host.browserId || (hostId ? `host:${hostId}` : null);
+  return {
+    connectId,
+    displayName: host.display_name || host.displayName || host.host_name || host.hostName || "Unnamed host",
+    hostCode: host.host_code || host.hostCode || "",
+    deviceName: host.device_name || host.deviceName || "",
+    online: Boolean(host.online),
+    available: Boolean(host.available),
+    paired: Boolean(host.paired),
+    status: host.status || (host.online ? "online" : "offline"),
+  };
+}
+
+function setInitialStatus(message, tone = "neutral") {
+  setStatus(statusBox, logger, message, tone);
+}
+
+function setSessionStatus(message, tone = "neutral") {
+  setStatus(sessionStatusBox, logger, message, tone);
+}
+
+function showConnectScreen() {
+  connectScreen.classList.remove("hidden");
+  chatScreen.classList.add("hidden");
+  hostCodeInput.focus();
+}
+
+function showChatScreen() {
+  connectScreen.classList.add("hidden");
+  chatScreen.classList.remove("hidden");
+}
+
+function renderSessionState() {
+  const connected = Boolean(state.currentPair);
   chatInput.disabled = !state.chatReady;
   sendMessageButton.disabled = !state.chatReady;
-  chatCaption.textContent = state.chatReady
-    ? `Direct WebRTC chat is active with ${state.currentPair?.peerRole || "host"}.`
-    : "A host must be connected before messages can be sent.";
-  logger.logEvent("ui", "Metrics refreshed", {
-    role: state.me?.session?.role,
-    socketReady: state.socketReady,
-    peerState: state.peerState,
-    chatReady: state.chatReady,
-  });
+  leavePairButton.disabled = !connected;
+  if (connected) {
+    sessionTitle.textContent = state.currentPair.peerDisplayName || "Connected Host";
+    sessionSubtitle.textContent = state.chatReady
+      ? "Direct WebRTC chat is active."
+      : "Negotiating the direct peer connection.";
+    showChatScreen();
+    return;
+  }
+  sessionTitle.textContent = "OmniPortal Chat";
+  sessionSubtitle.textContent = "Connected to the selected host.";
+  showConnectScreen();
 }
 
 function appendChat(kind, text) {
   logger.logEvent("chat", `Appending ${kind} row`, text);
-  if (chatLog.children.length === 1 && chatLog.textContent.includes("Waiting for a host to connect.")) {
+  if (chatLog.children.length === 1 && chatLog.textContent.includes("Waiting for the host to connect.")) {
     chatLog.innerHTML = "";
   }
   const row = document.createElement("div");
@@ -61,89 +96,10 @@ function appendChat(kind, text) {
   chatLog.scrollTop = chatLog.scrollHeight;
 }
 
-function resetChatLog(message = "Waiting for a host to connect.") {
+function resetChatLog(message = "Waiting for the host to connect.") {
   logger.logEvent("chat", "Resetting chat log", message);
   chatLog.innerHTML = "";
   appendChat("system", message);
-}
-
-function renderMe() {
-  const session = state.me?.session;
-  if (!session) {
-    mePanel.innerHTML = '<div class="empty-card">This browser is not acting as a client yet.</div>';
-    return;
-  }
-
-  mePanel.innerHTML = `
-    <div class="item-card">
-      <strong>Browser Identity</strong>
-      <div class="tiny-note mono">${session.browser_id}</div>
-      <div class="pill-row">
-        <span class="pill client">${session.role.toUpperCase()}</span>
-        <span class="pill ${session.online ? "ok" : "warn"}">${session.online ? "Online" : "Offline"}</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderConnection() {
-  if (!state.currentPair) {
-    connectionPanel.innerHTML = '<div class="empty-card">No host is connected right now.</div>';
-    return;
-  }
-  connectionPanel.innerHTML = `
-    <div class="item-card">
-      <strong>Connected Host</strong>
-      <div class="tiny-note mono">${state.currentPair.peerBrowserId}</div>
-      <div class="pill-row">
-        <span class="pill host">${state.currentPair.peerRole.toUpperCase()}</span>
-        <span class="pill ok">${state.peerState}</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderHosts() {
-  logger.logEvent("render", "Rendering host list", { hostCount: state.hosts.length, clientReady: state.me?.session?.role === "client" });
-  if (!state.hosts.length) {
-    hostList.innerHTML = '<div class="empty-card">No connected hosts are visible right now.</div>';
-    return;
-  }
-
-  const isClient = state.me?.session?.role === "client";
-  hostList.innerHTML = state.hosts.map((host) => {
-    const busyText = host.paired ? "Busy" : "Available";
-    const canConnect = isClient && host.available && !state.currentPair;
-    return `
-      <div class="item-card">
-        <strong>${host.host_name}</strong>
-        <div class="tiny-note">Registered: ${formatTime(host.created_at)}</div>
-        <div class="tiny-note mono">${host.browser_id}</div>
-        <div class="pill-row">
-          <span class="pill ok">${host.online ? "Online" : "Offline"}</span>
-          <span class="pill ${host.available ? "ok" : "warn"}">${busyText}</span>
-        </div>
-        ${canConnect ? `<button class="primary-button connect-host-button" data-host-id="${host.browser_id}">Connect to this host</button>` : ""}
-      </div>
-    `;
-  }).join("");
-
-  document.querySelectorAll(".connect-host-button").forEach((button) => {
-    button.addEventListener("click", () => {
-      logger.logEvent("click", "Connect host button clicked", { hostBrowserId: button.dataset.hostId });
-      startPairing(button.dataset.hostId).catch((error) => {
-        logger.logError("pairing", "Unhandled connect error", error);
-        setStatus(statusBox, logger, error.message, "error");
-      });
-    });
-  });
-}
-
-function renderAll() {
-  renderMe();
-  renderConnection();
-  renderHosts();
-  renderMetrics();
 }
 
 async function loadConfig() {
@@ -151,15 +107,9 @@ async function loadConfig() {
   state.stunServers = data.stun_servers || [];
 }
 
-async function loadMe() {
+async function ensureClientMode() {
+  await fetchJson("/api/client/join", { method: "POST" }, logger);
   state.me = await fetchJson("/api/me", undefined, logger);
-  renderAll();
-}
-
-async function loadHosts() {
-  const data = await fetchJson("/api/hosts", undefined, logger);
-  state.hosts = data.hosts || [];
-  renderHosts();
 }
 
 function teardownDataChannel() {
@@ -193,12 +143,10 @@ function teardownPeerConnection() {
   }
   state.peerConnection = null;
   state.peerState = state.currentPair ? "Connecting" : "Idle";
-  renderMetrics();
 }
 
 async function notifyRtcState(peerState) {
   state.peerState = peerState;
-  renderMetrics();
   if (!state.socketReady || !state.currentPair) {
     return;
   }
@@ -215,6 +163,8 @@ function bindDataChannel(channel) {
   channel.onopen = async () => {
     state.chatReady = true;
     appendChat("system", "Direct peer connection is ready.");
+    setSessionStatus("Host connected successfully.", "success");
+    renderSessionState();
     await notifyRtcState("Connected");
   };
   channel.onmessage = (event) => {
@@ -224,12 +174,13 @@ function bindDataChannel(channel) {
   channel.onclose = async () => {
     state.chatReady = false;
     appendChat("system", "Direct peer channel closed.");
+    renderSessionState();
     await notifyRtcState("Disconnected");
-    renderMetrics();
   };
   channel.onerror = (error) => {
     logger.logError("webrtc", "Data channel error", error);
     appendChat("system", "A peer channel error occurred.");
+    setSessionStatus("A peer channel error occurred.", "error");
   };
 }
 
@@ -245,7 +196,7 @@ function ensurePeerConnection() {
     }
     state.socket.send(JSON.stringify({
       type: "signal",
-      target_browser_id: state.currentPair.peerBrowserId,
+      target_peer_id: state.currentPair.peerId,
       signal: {
         kind: "ice_candidate",
         candidate: event.candidate,
@@ -264,9 +215,10 @@ function ensurePeerConnection() {
       await notifyRtcState("Connecting");
     } else if (nextState === "disconnected") {
       await notifyRtcState("Disconnected");
+      setSessionStatus("Peer link disconnected. Returning to PIN entry.", "error");
     } else if (nextState === "failed") {
       await notifyRtcState("Failed");
-      setStatus(statusBox, logger, "Direct peer connection failed. Try selecting the host again.", "error");
+      setSessionStatus("Direct peer connection failed. Returning to PIN entry.", "error");
     } else if (nextState === "closed") {
       await notifyRtcState("Closed");
     }
@@ -287,19 +239,19 @@ async function startOffer() {
   await connection.setLocalDescription(offer);
   state.socket.send(JSON.stringify({
     type: "signal",
-    target_browser_id: state.currentPair.peerBrowserId,
+    target_peer_id: state.currentPair.peerId,
     signal: {
       kind: "offer",
       sdp: offer,
     },
   }));
   state.peerState = "Signaling";
-  renderMetrics();
 }
 
 async function handleSignalMessage(payload) {
   logger.logEvent("signal", "Received signal", payload);
-  if (!state.currentPair || payload.from_browser_id !== state.currentPair.peerBrowserId) {
+  const fromPeerId = payload.from_peer_id || payload.from_browser_id;
+  if (!state.currentPair || fromPeerId !== state.currentPair.peerId) {
     return;
   }
 
@@ -316,14 +268,13 @@ async function handleSignalMessage(payload) {
     await connection.setLocalDescription(answer);
     state.socket.send(JSON.stringify({
       type: "signal",
-      target_browser_id: state.currentPair.peerBrowserId,
+      target_peer_id: state.currentPair.peerId,
       signal: {
         kind: "answer",
         sdp: answer,
       },
     }));
     state.peerState = "Signaling";
-    renderMetrics();
     return;
   }
 
@@ -350,12 +301,16 @@ async function handlePairingStarted(payload) {
   resetChatLog("Host selected. Negotiating direct WebRTC channel.");
   state.currentPair = {
     pairId: payload.pair_id,
-    peerBrowserId: payload.peer_browser_id,
+    peerId: payload.peer_id || payload.peer_browser_id,
     peerRole: payload.peer_role,
+    peerDisplayName: payload.peer_display_name || "Connected Host",
   };
+  state.awaitingPairing = false;
+  state.pendingPin = "";
+  hostCodeInput.value = "";
   state.peerState = "Signaling";
-  state.chatReady = false;
-  renderAll();
+  setSessionStatus("Pairing accepted. Negotiating direct connection.", "success");
+  renderSessionState();
   if (payload.initiator) {
     await startOffer();
   }
@@ -365,11 +320,47 @@ async function handlePairingCleared(payload) {
   logger.logEvent("pairing", "Pairing cleared", payload);
   teardownPeerConnection();
   state.currentPair = null;
+  state.awaitingPairing = false;
   state.peerState = "Idle";
   state.chatReady = false;
   resetChatLog(`Connection ended: ${payload.reason || "peer left"}.`);
-  await loadHosts();
-  renderAll();
+  renderSessionState();
+  setInitialStatus(`Connection ended: ${payload.reason || "peer left"}. Enter a host PIN to connect again.`, "neutral");
+}
+
+function clearReconnectTimer() {
+  if (state.reconnectTimer) {
+    window.clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+}
+
+async function loadHosts() {
+  const data = await fetchJson("/api/hosts", undefined, logger);
+  state.hosts = (data.hosts || []).map(normalizeHost);
+}
+
+async function attemptPendingPin() {
+  if (state.pendingPin && state.pendingPin.length === 6 && state.socketReady && !state.awaitingPairing && !state.currentPair) {
+    await startPairing(state.pendingPin);
+  }
+}
+
+function scheduleReconnect(reason = "signal_lost") {
+  if (!state.autoConnectEnabled || state.reconnectTimer) {
+    return;
+  }
+  const delay = state.reconnectDelayMs;
+  state.reconnectTimer = window.setTimeout(() => {
+    state.reconnectTimer = null;
+    ensureClientConnected(true).catch((error) => {
+      logger.logError("socket", "Reconnect attempt failed", error);
+      setInitialStatus(`Reconnecting to OmniPortal failed: ${error.message}`, "error");
+      state.reconnectDelayMs = Math.min(state.reconnectDelayMs * 2, 15000);
+      scheduleReconnect(reason);
+    });
+  }, delay);
+  setInitialStatus("Reconnecting to OmniPortal...", reason === "signal_lost" ? "neutral" : "error");
 }
 
 function stopSocket() {
@@ -389,25 +380,23 @@ function stopSocket() {
 
 async function openSocket(forceReconnect = false) {
   logger.logEvent("socket", "Open socket requested", { forceReconnect });
-  if (state.me?.session?.role !== "client") {
-    return;
-  }
   if (state.socket && state.socketReady && !forceReconnect) {
     return;
   }
 
   stopSocket();
-  renderMetrics();
   const socket = new WebSocket(socketUrl());
   state.socket = socket;
 
   socket.onopen = async () => {
     logger.logEvent("socket", "WebSocket opened");
+    clearReconnectTimer();
+    state.reconnectDelayMs = 2000;
     state.socketReady = true;
     state.heartbeatTimer = startHeartbeat(() => state.socket, logger);
-    setStatus(statusBox, logger, "Client signaling channel connected.", "success");
-    renderMetrics();
+    setInitialStatus("Connected to OmniPortal. Enter the 6-digit host PIN.", "success");
     await loadHosts();
+    await attemptPendingPin();
   };
 
   socket.onmessage = async (event) => {
@@ -417,8 +406,7 @@ async function openSocket(forceReconnect = false) {
       return;
     }
     if (payload.type === "hosts_snapshot") {
-      state.hosts = payload.hosts || [];
-      renderHosts();
+      state.hosts = (payload.hosts || []).map(normalizeHost);
       return;
     }
     if (payload.type === "pairing_started") {
@@ -434,7 +422,12 @@ async function openSocket(forceReconnect = false) {
       return;
     }
     if (payload.type === "error") {
-      setStatus(statusBox, logger, payload.message || "An error occurred.", "error");
+      state.awaitingPairing = false;
+      if (!state.currentPair) {
+        setInitialStatus(payload.message || "Unable to connect to that host PIN.", "error");
+      } else {
+        setSessionStatus(payload.message || "An error occurred.", "error");
+      }
     }
   };
 
@@ -444,70 +437,51 @@ async function openSocket(forceReconnect = false) {
     state.heartbeatTimer = null;
     state.socketReady = false;
     state.socket = null;
+    state.awaitingPairing = false;
     if (state.currentPair) {
       await handlePairingCleared({ reason: "signaling_socket_closed" });
     }
-    renderMetrics();
-    setStatus(statusBox, logger, "Client signaling channel disconnected.", "error");
+    scheduleReconnect(event.reason || "signal_lost");
   };
 
   socket.onerror = (error) => {
     logger.logError("socket", "WebSocket error", error);
-    setStatus(statusBox, logger, "Client signaling channel encountered an error.", "error");
+    setInitialStatus("Client signaling channel encountered an error.", "error");
   };
 }
 
-async function enableClientMode() {
-  logger.logEvent("click", "Enable client mode button clicked");
-  try {
-    await fetchJson("/api/client/join", { method: "POST" }, logger);
-    await loadMe();
-    await openSocket(true);
-    await loadHosts();
-    setStatus(statusBox, logger, "This browser is now acting as a client.", "success");
-  } catch (error) {
-    logger.logError("client", "Failed to enable client mode", error);
-    setStatus(statusBox, logger, error.message, "error");
-  }
+async function ensureClientConnected(forceReconnect = false) {
+  await ensureClientMode();
+  await openSocket(forceReconnect);
 }
 
-async function resetSession() {
-  logger.logEvent("click", "Reset session button clicked");
-  try {
-    await fetchJson("/api/session/reset", { method: "POST" }, logger);
-  } catch (error) {
-    logger.logError("session", "Reset request failed", error);
-  } finally {
-    stopSocket();
-    teardownPeerConnection();
-    state.me = null;
-    state.currentPair = null;
-    state.hosts = [];
-    renderAll();
-    window.location.reload();
-  }
-}
+async function startPairing(hostCode) {
+  const normalizedPin = String(hostCode || "").replace(/\D/g, "").slice(0, 6);
+  logger.logEvent("pairing", "Client requested pairing", { hostCode: normalizedPin });
+  hostCodeInput.value = normalizedPin;
+  state.pendingPin = normalizedPin;
 
-async function startPairing(hostBrowserId) {
-  logger.logEvent("pairing", "Client requested pairing", { hostBrowserId });
-  if (state.me?.session?.role !== "client") {
-    setStatus(statusBox, logger, "Enable client mode before selecting a host.", "error");
+  if (!/^\d{6}$/.test(normalizedPin)) {
+    setInitialStatus("Enter a valid 6-digit host PIN.", "error");
     return;
   }
   if (!state.socketReady) {
-    setStatus(statusBox, logger, "The signaling socket is not connected yet.", "error");
+    setInitialStatus("Connecting to OmniPortal first. Your PIN will be submitted automatically.", "neutral");
     return;
   }
-  if (state.currentPair) {
-    setStatus(statusBox, logger, "Disconnect the current host before selecting a new one.", "error");
+  if (state.currentPair || state.awaitingPairing) {
     return;
   }
+
+  const matchingHost = state.hosts.find((host) => host.hostCode === normalizedPin);
+  state.awaitingPairing = true;
   resetChatLog("Requested host pairing. Waiting for signaling to start.");
   state.socket.send(JSON.stringify({
     type: "connect_to_host",
-    host_browser_id: hostBrowserId,
+    connect_id: matchingHost?.connectId || null,
+    host_code: normalizedPin,
   }));
-  setStatus(statusBox, logger, "Pairing request sent to the signaling server.", "success");
+  setInitialStatus("PIN submitted. Waiting for the host to respond.", "success");
 }
 
 function sendMessage() {
@@ -517,7 +491,7 @@ function sendMessage() {
     return;
   }
   if (!state.chatReady || !state.dataChannel || state.dataChannel.readyState !== "open") {
-    setStatus(statusBox, logger, "The direct host channel is not ready yet.", "error");
+    setSessionStatus("The direct host channel is not ready yet.", "error");
     return;
   }
   state.dataChannel.send(text);
@@ -536,49 +510,51 @@ async function disconnectHost() {
 
 async function boot() {
   logger.logEvent("boot", "Client page boot started");
+  renderSessionState();
+  hostCodeInput.focus();
   try {
     await loadConfig();
-    await loadMe();
-    await loadHosts();
-    if (state.me?.session?.role === "client") {
-      setStatus(statusBox, logger, "Recovered existing client session.", "success");
-      await openSocket();
-    } else if (state.me?.session?.role === "host") {
-      setStatus(statusBox, logger, "This browser is currently a host. Enabling client mode here will replace that session.", "neutral");
-    }
-    renderAll();
+    await ensureClientConnected();
     logger.logEvent("boot", "Client page boot completed");
   } catch (error) {
     logger.logError("boot", "Client page boot failed", error);
-    setStatus(statusBox, logger, error.message, "error");
+    setInitialStatus(`Could not connect to OmniPortal: ${error.message}`, "error");
+    scheduleReconnect("boot_failed");
   }
 }
 
-joinClientButton.addEventListener("click", () => {
-  enableClientMode().catch((error) => {
-    logger.logError("client", "Unhandled enable client mode error", error);
-    setStatus(statusBox, logger, error.message, "error");
-  });
+hostCodeInput.addEventListener("input", () => {
+  const numeric = hostCodeInput.value.replace(/\D/g, "").slice(0, 6);
+  if (hostCodeInput.value !== numeric) {
+    hostCodeInput.value = numeric;
+  }
+  if (numeric.length === 6) {
+    startPairing(numeric).catch((error) => {
+      logger.logError("pairing", "Unhandled connect error", error);
+      setInitialStatus(error.message, "error");
+      state.awaitingPairing = false;
+    });
+  }
 });
-refreshHostsButton.addEventListener("click", () => {
-  logger.logEvent("click", "Refresh hosts button clicked");
-  loadHosts().catch((error) => {
-    logger.logError("hosts", "Refresh hosts failed", error);
-    setStatus(statusBox, logger, error.message, "error");
-  });
+
+hostCodeInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    startPairing(hostCodeInput.value).catch((error) => {
+      logger.logError("pairing", "Unhandled connect error", error);
+      setInitialStatus(error.message, "error");
+      state.awaitingPairing = false;
+    });
+  }
 });
-resetSessionButton.addEventListener("click", () => {
-  resetSession().catch((error) => {
-    logger.logError("session", "Unhandled reset error", error);
-    setStatus(statusBox, logger, error.message, "error");
-  });
-});
+
 leavePairButton.addEventListener("click", () => {
   disconnectHost().catch((error) => {
     logger.logError("pairing", "Unhandled disconnect error", error);
-    setStatus(statusBox, logger, error.message, "error");
+    setSessionStatus(error.message, "error");
   });
 });
+
 chatInput.addEventListener("keydown", (event) => {
   logger.logEvent("input", "Chat keydown", { key: event.key });
   if (event.key === "Enter") {
@@ -586,8 +562,12 @@ chatInput.addEventListener("keydown", (event) => {
     sendMessage();
   }
 });
+
 sendMessageButton.addEventListener("click", sendMessage);
+
 window.addEventListener("beforeunload", () => {
+  state.autoConnectEnabled = false;
+  clearReconnectTimer();
   stopSocket();
 });
 
