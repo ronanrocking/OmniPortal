@@ -93,6 +93,13 @@ h2 {
   line-height: 1.6;
 }
 
+.session-metric {
+  margin-top: 10px;
+  font-size: 0.86rem;
+  color: #7b654c;
+  letter-spacing: 0.02em;
+}
+
 .detail-list {
   display: grid;
   gap: 12px;

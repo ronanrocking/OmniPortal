@@ -111,7 +111,11 @@ function renderAll() {
 
 async function loadConfig() {
   const data = await fetchJson("/api/config", undefined, logger);
-  state.stunServers = data.stun_servers || [];
+  state.stunServers = data.ice_servers || data.stun_servers || [];
+  logger.logEvent("webrtc", "Loaded ICE config", {
+    source: data.ice_source || "unknown",
+    count: state.stunServers.length,
+  });
 }
 
 async function loadMe() {

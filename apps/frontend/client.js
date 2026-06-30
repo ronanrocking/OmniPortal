@@ -1,9 +1,18 @@
 import { createLogger, fetchJson, setStatus, socketUrl, startHeartbeat, stopHeartbeat } from "/frontend/shared.js";
 
 const logger = createLogger("OmniPortalClient");
+const DIRECT_ATTEMPT_TIMEOUT_MS = 8000;
+const PAIRING_ATTEMPT_TIMEOUT_MS = 30000;
+const MAX_CHAT_MESSAGE_LENGTH = 400;
+const PROTOCOL_TYPE_CHAT = "chat";
+const PROTOCOL_TYPE_PING = "ping";
+const PROTOCOL_TYPE_PONG = "pong";
 const state = {
   me: null,
   stunServers: [],
+  directIceServers: [],
+  relayIceServers: [],
+  currentIceMode: "direct",
   socket: null,
   socketReady: false,
   heartbeatTimer: null,
@@ -18,6 +27,9 @@ const state = {
   autoConnectEnabled: true,
   pendingPin: "",
   awaitingPairing: false,
+  directAttemptTimer: null,
+  pairingAttemptTimer: null,
+  pendingRemoteCandidates: [],
 };
 
 const connectScreen = document.getElementById("connectScreen");
@@ -53,6 +65,84 @@ function setInitialStatus(message, tone = "neutral") {
 
 function setSessionStatus(message, tone = "neutral") {
   setStatus(sessionStatusBox, logger, message, tone);
+}
+
+function humanizeReason(reason) {
+  switch (reason) {
+    case "left_by_user":
+      return "the session was ended";
+    case "peer_disconnected":
+      return "the other side disconnected";
+    case "signaling_socket_closed":
+      return "the signaling connection was lost";
+    case "heartbeat_timeout":
+      return "the connection timed out";
+    case "host_went_offline":
+      return "the host went offline";
+    case "pairing_timeout":
+      return "the connection attempt timed out";
+    case "replaced_by_new_pair":
+      return "a newer connection attempt replaced this one";
+    case "rtc_failed":
+      return "the direct connection failed";
+    case "rtc_disconnected":
+      return "the direct connection was interrupted";
+    case "rtc_closed":
+      return "the direct connection was closed";
+    case "role_changed":
+    case "session_reset":
+      return "the session was reset";
+    default:
+      return reason ? String(reason).replace(/_/g, " ") : "the session ended";
+  }
+}
+
+function clearPairingAttemptTimer() {
+  if (state.pairingAttemptTimer) {
+    window.clearTimeout(state.pairingAttemptTimer);
+    state.pairingAttemptTimer = null;
+  }
+}
+
+function clearDirectAttemptTimer() {
+  if (state.directAttemptTimer) {
+    window.clearTimeout(state.directAttemptTimer);
+    state.directAttemptTimer = null;
+  }
+}
+
+function startPairingAttemptTimer() {
+  clearPairingAttemptTimer();
+  state.pairingAttemptTimer = window.setTimeout(() => {
+    state.pairingAttemptTimer = null;
+    if (!state.currentPair || state.chatReady) {
+      return;
+    }
+    logger.logEvent("pairing", "Pairing attempt timed out", state.currentPair);
+    setSessionStatus("The host did not finish establishing the direct connection in time.", "error");
+    if (state.socketReady) {
+      state.socket.send(JSON.stringify({ type: "leave_pair" }));
+    }
+    handlePairingCleared({ reason: "pairing_timeout" }).catch((error) => {
+      logger.logError("pairing", "Timed pairing cleanup failed", error);
+    });
+  }, PAIRING_ATTEMPT_TIMEOUT_MS);
+}
+
+function startDirectAttemptTimer() {
+  clearDirectAttemptTimer();
+  if (state.currentIceMode !== "direct") {
+    return;
+  }
+  state.directAttemptTimer = window.setTimeout(() => {
+    state.directAttemptTimer = null;
+    if (!state.currentPair || state.chatReady || state.currentIceMode !== "direct") {
+      return;
+    }
+    promoteToRelayMode("direct_timeout").catch((error) => {
+      logger.logError("webrtc", "Relay fallback failed after direct timeout", error);
+    });
+  }, DIRECT_ATTEMPT_TIMEOUT_MS);
 }
 
 function showConnectScreen() {
@@ -104,7 +194,14 @@ function resetChatLog(message = "Waiting for the host to connect.") {
 
 async function loadConfig() {
   const data = await fetchJson("/api/config", undefined, logger);
-  state.stunServers = data.stun_servers || [];
+  state.directIceServers = data.direct_ice_servers || [];
+  state.relayIceServers = data.ice_servers || data.stun_servers || [];
+  state.stunServers = state.directIceServers.length ? state.directIceServers : state.relayIceServers;
+  logger.logEvent("webrtc", "Loaded ICE config", {
+    source: data.ice_source || "unknown",
+    directCount: state.directIceServers.length,
+    relayCount: state.relayIceServers.length,
+  });
 }
 
 async function ensureClientMode() {
@@ -130,19 +227,53 @@ function teardownDataChannel() {
 }
 
 function teardownPeerConnection() {
+  clearDirectAttemptTimer();
+  clearPairingAttemptTimer();
   teardownDataChannel();
   if (state.peerConnection) {
     try {
       state.peerConnection.onicecandidate = null;
       state.peerConnection.ondatachannel = null;
       state.peerConnection.onconnectionstatechange = null;
+      state.peerConnection.oniceconnectionstatechange = null;
+      state.peerConnection.onicecandidateerror = null;
       state.peerConnection.close();
     } catch (error) {
       logger.logError("webrtc", "Peer connection close failed", error);
     }
   }
   state.peerConnection = null;
+  state.pendingRemoteCandidates = [];
   state.peerState = state.currentPair ? "Connecting" : "Idle";
+}
+
+function hasRelayFallback() {
+  return state.relayIceServers.length > 0
+    && JSON.stringify(state.relayIceServers) !== JSON.stringify(state.directIceServers);
+}
+
+function activeIceServers() {
+  if (state.currentIceMode === "relay" && state.relayIceServers.length) {
+    return state.relayIceServers;
+  }
+  if (state.directIceServers.length) {
+    return state.directIceServers;
+  }
+  return state.relayIceServers;
+}
+
+async function promoteToRelayMode(reason) {
+  if (!state.currentPair || state.chatReady || state.currentIceMode === "relay" || !hasRelayFallback()) {
+    return;
+  }
+  logger.logEvent("webrtc", "Promoting to TURN relay mode", { reason });
+  clearDirectAttemptTimer();
+  state.currentIceMode = "relay";
+  setSessionStatus("Direct path failed. Retrying with TURN relay.", "neutral");
+  teardownPeerConnection();
+  if (state.currentPair) {
+    await startOffer();
+  }
 }
 
 async function notifyRtcState(peerState) {
@@ -157,10 +288,28 @@ async function notifyRtcState(peerState) {
   }
 }
 
+async function flushPendingIceCandidates(connection) {
+  if (!connection.remoteDescription) {
+    return;
+  }
+  const queuedCandidates = [...state.pendingRemoteCandidates];
+  state.pendingRemoteCandidates = [];
+  for (const candidate of queuedCandidates) {
+    try {
+      await connection.addIceCandidate(candidate);
+      logger.logEvent("signal", "Queued ICE candidate applied");
+    } catch (error) {
+      logger.logError("signal", "Queued ICE candidate rejected", error);
+    }
+  }
+}
+
 function bindDataChannel(channel) {
   logger.logEvent("webrtc", "Binding data channel", { label: channel.label, readyState: channel.readyState });
   state.dataChannel = channel;
   channel.onopen = async () => {
+    clearDirectAttemptTimer();
+    clearPairingAttemptTimer();
     state.chatReady = true;
     appendChat("system", "Direct peer connection is ready.");
     setSessionStatus("Host connected successfully.", "success");
@@ -168,8 +317,7 @@ function bindDataChannel(channel) {
     await notifyRtcState("Connected");
   };
   channel.onmessage = (event) => {
-    logger.logEvent("webrtc", "Message received", event.data);
-    appendChat("peer", `Host: ${event.data}`);
+    handleProtocolMessage(event.data);
   };
   channel.onclose = async () => {
     state.chatReady = false;
@@ -188,8 +336,12 @@ function ensurePeerConnection() {
   if (state.peerConnection) {
     return state.peerConnection;
   }
-  const connection = new RTCPeerConnection({ iceServers: state.stunServers });
-  logger.logEvent("webrtc", "Creating RTCPeerConnection", state.stunServers);
+  const selectedIceServers = activeIceServers();
+  const connection = new RTCPeerConnection({ iceServers: selectedIceServers, iceTransportPolicy: "all" });
+  logger.logEvent("webrtc", "Creating RTCPeerConnection", {
+    mode: state.currentIceMode,
+    iceServers: selectedIceServers,
+  });
   connection.onicecandidate = (event) => {
     if (!event.candidate || !state.socketReady || !state.currentPair) {
       return;
@@ -200,25 +352,41 @@ function ensurePeerConnection() {
       signal: {
         kind: "ice_candidate",
         candidate: event.candidate,
+        ice_mode: state.currentIceMode,
       },
     }));
   };
   connection.ondatachannel = (event) => {
     bindDataChannel(event.channel);
   };
+  connection.oniceconnectionstatechange = () => {
+    logger.logEvent("webrtc", "ICE connection state changed", connection.iceConnectionState || "unknown");
+  };
+  connection.onicecandidateerror = (event) => {
+    logger.logError("webrtc", "ICE candidate error", event);
+  };
   connection.onconnectionstatechange = async () => {
     const nextState = connection.connectionState || "unknown";
     logger.logEvent("webrtc", "Peer connection state changed", nextState);
     if (nextState === "connected") {
+      clearDirectAttemptTimer();
       await notifyRtcState("Connected");
     } else if (nextState === "connecting") {
       await notifyRtcState("Connecting");
     } else if (nextState === "disconnected") {
       await notifyRtcState("Disconnected");
-      setSessionStatus("Peer link disconnected. Returning to PIN entry.", "error");
+      if (!state.chatReady && state.currentIceMode === "direct" && hasRelayFallback()) {
+        await promoteToRelayMode("direct_disconnected");
+        return;
+      }
+      setSessionStatus("Peer link disconnected. Resetting the session.", "error");
     } else if (nextState === "failed") {
+      if (!state.chatReady && state.currentIceMode === "direct" && hasRelayFallback()) {
+        await promoteToRelayMode("direct_failed");
+        return;
+      }
       await notifyRtcState("Failed");
-      setSessionStatus("Direct peer connection failed. Returning to PIN entry.", "error");
+      setSessionStatus("Direct peer connection failed. Resetting the session.", "error");
     } else if (nextState === "closed") {
       await notifyRtcState("Closed");
     }
@@ -231,21 +399,29 @@ async function startOffer() {
   if (!state.currentPair) {
     return;
   }
-  const connection = ensurePeerConnection();
-  if (!state.dataChannel) {
-    bindDataChannel(connection.createDataChannel("chat"));
+  try {
+    logger.logEvent("webrtc", "Starting offer", { mode: state.currentIceMode });
+    const connection = ensurePeerConnection();
+    if (!state.dataChannel) {
+      bindDataChannel(connection.createDataChannel("chat"));
+    }
+    const offer = await connection.createOffer();
+    await connection.setLocalDescription(offer);
+    state.socket.send(JSON.stringify({
+      type: "signal",
+      target_peer_id: state.currentPair.peerId,
+      signal: {
+        kind: "offer",
+        sdp: offer,
+        ice_mode: state.currentIceMode,
+      },
+    }));
+    state.peerState = "Signaling";
+  } catch (error) {
+    logger.logError("webrtc", "Failed to start offer", error);
+    setSessionStatus("Could not start the direct connection.", "error");
+    await notifyRtcState("Failed");
   }
-  const offer = await connection.createOffer();
-  await connection.setLocalDescription(offer);
-  state.socket.send(JSON.stringify({
-    type: "signal",
-    target_peer_id: state.currentPair.peerId,
-    signal: {
-      kind: "offer",
-      sdp: offer,
-    },
-  }));
-  state.peerState = "Signaling";
 }
 
 async function handleSignalMessage(payload) {
@@ -256,48 +432,76 @@ async function handleSignalMessage(payload) {
   }
 
   const signal = payload.signal || {};
+  const incomingIceMode = signal.ice_mode === "relay" ? "relay" : "direct";
+  if (signal.kind === "ice_candidate" && incomingIceMode !== state.currentIceMode) {
+    logger.logEvent("webrtc", "Ignoring stale ICE candidate for old mode", {
+      activeMode: state.currentIceMode,
+      candidateMode: incomingIceMode,
+    });
+    return;
+  }
+  if ((signal.kind === "offer" || signal.kind === "answer") && incomingIceMode !== state.currentIceMode) {
+    logger.logEvent("webrtc", "Switching ICE mode from remote signal", {
+      from: state.currentIceMode,
+      to: incomingIceMode,
+      kind: signal.kind,
+    });
+    state.currentIceMode = incomingIceMode;
+    teardownPeerConnection();
+  }
   let connection = ensurePeerConnection();
 
-  if (signal.kind === "offer") {
-    if (connection.signalingState !== "stable") {
-      teardownPeerConnection();
-      connection = ensurePeerConnection();
-    }
-    await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-    const answer = await connection.createAnswer();
-    await connection.setLocalDescription(answer);
-    state.socket.send(JSON.stringify({
-      type: "signal",
-      target_peer_id: state.currentPair.peerId,
-      signal: {
-        kind: "answer",
-        sdp: answer,
-      },
-    }));
-    state.peerState = "Signaling";
-    return;
-  }
-
-  if (signal.kind === "answer") {
-    if (!connection.localDescription) {
+  try {
+    if (signal.kind === "offer") {
+      if (connection.signalingState !== "stable") {
+        teardownPeerConnection();
+        connection = ensurePeerConnection();
+      }
+      await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      await flushPendingIceCandidates(connection);
+      const answer = await connection.createAnswer();
+      await connection.setLocalDescription(answer);
+      state.socket.send(JSON.stringify({
+        type: "signal",
+        target_peer_id: state.currentPair.peerId,
+        signal: {
+          kind: "answer",
+          sdp: answer,
+          ice_mode: state.currentIceMode,
+        },
+      }));
+      state.peerState = "Signaling";
       return;
     }
-    await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-    return;
-  }
 
-  if (signal.kind === "ice_candidate" && signal.candidate) {
-    try {
-      await connection.addIceCandidate(signal.candidate);
-    } catch (error) {
-      logger.logError("signal", "ICE candidate rejected", error);
+    if (signal.kind === "answer") {
+      if (!connection.localDescription) {
+        return;
+      }
+      await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      await flushPendingIceCandidates(connection);
+      return;
     }
+
+    if (signal.kind === "ice_candidate" && signal.candidate) {
+      if (!connection.remoteDescription) {
+        logger.logEvent("signal", "Queueing ICE candidate until remote description is set");
+        state.pendingRemoteCandidates.push(signal.candidate);
+        return;
+      }
+      await connection.addIceCandidate(signal.candidate);
+    }
+  } catch (error) {
+    logger.logError("signal", "Failed to process signal", { signal, error });
+    setSessionStatus("The direct connection signaling failed.", "error");
+    await notifyRtcState("Failed");
   }
 }
 
 async function handlePairingStarted(payload) {
   logger.logEvent("pairing", "Pairing started", payload);
   teardownPeerConnection();
+  state.currentIceMode = "direct";
   resetChatLog("Host selected. Negotiating direct WebRTC channel.");
   state.currentPair = {
     pairId: payload.pair_id,
@@ -311,6 +515,8 @@ async function handlePairingStarted(payload) {
   state.peerState = "Signaling";
   setSessionStatus("Pairing accepted. Negotiating direct connection.", "success");
   renderSessionState();
+  startPairingAttemptTimer();
+  startDirectAttemptTimer();
   if (payload.initiator) {
     await startOffer();
   }
@@ -319,13 +525,45 @@ async function handlePairingStarted(payload) {
 async function handlePairingCleared(payload) {
   logger.logEvent("pairing", "Pairing cleared", payload);
   teardownPeerConnection();
+  state.currentIceMode = "direct";
   state.currentPair = null;
   state.awaitingPairing = false;
   state.peerState = "Idle";
   state.chatReady = false;
-  resetChatLog(`Connection ended: ${payload.reason || "peer left"}.`);
+  const reasonLabel = humanizeReason(payload.reason);
+  resetChatLog(`Connection ended because ${reasonLabel}.`);
   renderSessionState();
-  setInitialStatus(`Connection ended: ${payload.reason || "peer left"}. Enter a host PIN to connect again.`, "neutral");
+  setInitialStatus(`Connection ended because ${reasonLabel}. Enter a host PIN to connect again.`, "neutral");
+}
+
+function sendProtocolPayload(payload) {
+  if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+    throw new Error("The direct host channel is not ready yet.");
+  }
+  state.dataChannel.send(JSON.stringify(payload));
+}
+
+function handleProtocolMessage(raw) {
+  logger.logEvent("webrtc", "Message received", raw);
+  let payload = null;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    appendChat("peer", `Host: ${raw}`);
+    return;
+  }
+
+  if (payload?.type === PROTOCOL_TYPE_CHAT) {
+    appendChat("peer", `Host: ${payload.text || ""}`);
+    return;
+  }
+  if (payload?.type === PROTOCOL_TYPE_PING && payload.id) {
+    try {
+      sendProtocolPayload({ type: PROTOCOL_TYPE_PONG, id: payload.id, sent_at: payload.sent_at });
+    } catch (error) {
+      logger.logError("webrtc", "Failed to respond to ping", error);
+    }
+  }
 }
 
 function clearReconnectTimer() {
@@ -364,6 +602,8 @@ function scheduleReconnect(reason = "signal_lost") {
 }
 
 function stopSocket() {
+  clearDirectAttemptTimer();
+  clearPairingAttemptTimer();
   if (state.socket) {
     try {
       state.socket.onclose = null;
@@ -423,6 +663,7 @@ async function openSocket(forceReconnect = false) {
     }
     if (payload.type === "error") {
       state.awaitingPairing = false;
+      clearPairingAttemptTimer();
       if (!state.currentPair) {
         setInitialStatus(payload.message || "Unable to connect to that host PIN.", "error");
       } else {
@@ -438,6 +679,7 @@ async function openSocket(forceReconnect = false) {
     state.socketReady = false;
     state.socket = null;
     state.awaitingPairing = false;
+    clearPairingAttemptTimer();
     if (state.currentPair) {
       await handlePairingCleared({ reason: "signaling_socket_closed" });
     }
@@ -474,6 +716,14 @@ async function startPairing(hostCode) {
   }
 
   const matchingHost = state.hosts.find((host) => host.hostCode === normalizedPin);
+  if (matchingHost && !matchingHost.online) {
+    setInitialStatus("That host PIN belongs to a host that is currently offline.", "error");
+    return;
+  }
+  if (matchingHost && !matchingHost.available) {
+    setInitialStatus("That host is already busy with another client.", "error");
+    return;
+  }
   state.awaitingPairing = true;
   resetChatLog("Requested host pairing. Waiting for signaling to start.");
   state.socket.send(JSON.stringify({
@@ -485,7 +735,7 @@ async function startPairing(hostCode) {
 }
 
 function sendMessage() {
-  const text = chatInput.value.trim();
+  const text = chatInput.value.trim().slice(0, MAX_CHAT_MESSAGE_LENGTH);
   logger.logEvent("click", "Send message button clicked", { textLength: text.length });
   if (!text) {
     return;
@@ -494,7 +744,7 @@ function sendMessage() {
     setSessionStatus("The direct host channel is not ready yet.", "error");
     return;
   }
-  state.dataChannel.send(text);
+  sendProtocolPayload({ type: PROTOCOL_TYPE_CHAT, text });
   appendChat("self", `You: ${text}`);
   chatInput.value = "";
 }

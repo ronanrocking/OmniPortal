@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const DEFAULT_SERVER_URL = process.env.OMNIPORTAL_SERVER_URL || "https://omniportal.ronanrocking.com";
 const WINDOW_TITLE = "OmniPortal Host";
+const HOST_CODE_PATTERN = /^\d{6}$/;
 
 function configPath() {
   return path.join(app.getPath("userData"), "host-config.json");
@@ -16,8 +17,29 @@ function generateHostCode() {
 }
 
 function normalizeServerUrl(value) {
-  const trimmed = String(value || "").trim();
-  return trimmed.replace(/\/+$/, "") || DEFAULT_SERVER_URL;
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  const candidate = trimmed || DEFAULT_SERVER_URL;
+  const parsed = new URL(candidate);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Server URL must start with http:// or https://");
+  }
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+function normalizeDisplayName(value) {
+  const normalized = String(value ?? "").trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return "";
+  }
+  return normalized.slice(0, 50);
+}
+
+function normalizeHostCode(value, fallbackCode) {
+  const nextCode = String(value || fallbackCode || "").trim();
+  if (!HOST_CODE_PATTERN.test(nextCode)) {
+    return generateHostCode();
+  }
+  return nextCode;
 }
 
 function defaultConfig() {
@@ -59,8 +81,8 @@ async function writeConfig(nextConfig) {
     ...current,
     ...nextConfig,
     host_id: current.host_id,
-    host_code: nextConfig.host_code || current.host_code,
-    display_name: String(nextConfig.display_name ?? current.display_name ?? "").trim(),
+    host_code: normalizeHostCode(nextConfig.host_code, current.host_code),
+    display_name: normalizeDisplayName(nextConfig.display_name ?? current.display_name),
     server_url: normalizeServerUrl(nextConfig.server_url ?? current.server_url ?? DEFAULT_SERVER_URL),
     created_at: current.created_at || now,
     updated_at: now

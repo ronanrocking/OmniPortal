@@ -1,8 +1,19 @@
 (function () {
+  const DIRECT_ATTEMPT_TIMEOUT_MS = 8000;
+  const PAIRING_ATTEMPT_TIMEOUT_MS = 30000;
+  const MAX_CHAT_MESSAGE_LENGTH = 400;
+  const LATENCY_PING_INTERVAL_MS = 10000;
+  const LATENCY_PING_INITIAL_DELAY_MS = 1500;
+  const PROTOCOL_TYPE_CHAT = "chat";
+  const PROTOCOL_TYPE_PING = "ping";
+  const PROTOCOL_TYPE_PONG = "pong";
   const state = {
     config: null,
     runtime: null,
     stunServers: [],
+    directIceServers: [],
+    relayIceServers: [],
+    currentIceMode: "direct",
     socket: null,
     socketReady: false,
     heartbeatTimer: null,
@@ -16,6 +27,11 @@
     autoConnectEnabled: true,
     modalMode: null,
     modalPinGenerated: false,
+    directAttemptTimer: null,
+    pairingAttemptTimer: null,
+    pendingRemoteCandidates: [],
+    latencyPingTimer: null,
+    lastLatencyMs: null,
   };
 
   const waitingScreen = document.getElementById("waitingScreen");
@@ -29,6 +45,7 @@
   const hostIdValue = document.getElementById("hostIdValue");
   const sessionTitle = document.getElementById("sessionTitle");
   const sessionSubtitle = document.getElementById("sessionSubtitle");
+  const latencyMetric = document.getElementById("latencyMetric");
   const leavePairButton = document.getElementById("leavePairButton");
   const chatLog = document.getElementById("chatLog");
   const chatInput = document.getElementById("chatInput");
@@ -65,6 +82,109 @@
 
   function setSessionStatus(message, tone = "neutral") {
     setLineStatus(sessionStatusLine, message, tone);
+  }
+
+  function humanizeReason(reason) {
+    switch (reason) {
+      case "left_by_user":
+        return "the session was ended";
+      case "peer_disconnected":
+        return "the other side disconnected";
+      case "signaling_socket_closed":
+        return "the signaling connection was lost";
+      case "heartbeat_timeout":
+        return "the connection timed out";
+      case "host_went_offline":
+        return "the host went offline";
+      case "pairing_timeout":
+        return "the connection attempt timed out";
+      case "replaced_by_new_pair":
+        return "a newer connection attempt replaced this one";
+      case "rtc_failed":
+        return "the direct connection failed";
+      case "rtc_disconnected":
+        return "the direct connection was interrupted";
+      case "rtc_closed":
+        return "the direct connection was closed";
+      default:
+        return reason ? String(reason).replace(/_/g, " ") : "the session ended";
+    }
+  }
+
+  function clearPairingAttemptTimer() {
+    if (state.pairingAttemptTimer) {
+      window.clearTimeout(state.pairingAttemptTimer);
+      state.pairingAttemptTimer = null;
+    }
+  }
+
+  function clearDirectAttemptTimer() {
+    if (state.directAttemptTimer) {
+      window.clearTimeout(state.directAttemptTimer);
+      state.directAttemptTimer = null;
+    }
+  }
+
+  function stopLatencyPings() {
+    if (state.latencyPingTimer) {
+      window.clearTimeout(state.latencyPingTimer);
+      state.latencyPingTimer = null;
+    }
+  }
+
+  function renderLatencyMetric() {
+    if (!latencyMetric) {
+      return;
+    }
+    if (!state.currentPair) {
+      latencyMetric.textContent = "Latency unavailable";
+      return;
+    }
+    if (!state.chatReady) {
+      latencyMetric.textContent = state.currentIceMode === "relay"
+        ? "Retrying through TURN relay..."
+        : "Measuring direct path...";
+      return;
+    }
+    if (typeof state.lastLatencyMs === "number") {
+      latencyMetric.textContent = `Last RTT ${state.lastLatencyMs} ms`;
+      return;
+    }
+    latencyMetric.textContent = "Measuring latency...";
+  }
+
+  function startPairingAttemptTimer() {
+    clearPairingAttemptTimer();
+    state.pairingAttemptTimer = window.setTimeout(() => {
+      state.pairingAttemptTimer = null;
+      if (!state.currentPair || state.chatReady) {
+        return;
+      }
+      log("pairing", "Pairing attempt timed out", state.currentPair);
+      setSessionStatus("The client did not finish establishing the direct connection in time.", "error");
+      if (state.socketReady) {
+        state.socket.send(JSON.stringify({ type: "leave_pair" }));
+      }
+      handlePairingCleared({ reason: "pairing_timeout" }).catch((error) => {
+        logError("pairing", "Timed pairing cleanup failed", error);
+      });
+    }, PAIRING_ATTEMPT_TIMEOUT_MS);
+  }
+
+  function startDirectAttemptTimer() {
+    clearDirectAttemptTimer();
+    if (state.currentIceMode !== "direct") {
+      return;
+    }
+    state.directAttemptTimer = window.setTimeout(() => {
+      state.directAttemptTimer = null;
+      if (!state.currentPair || state.chatReady || state.currentIceMode !== "direct") {
+        return;
+      }
+      promoteToRelayMode("direct_timeout").catch((error) => {
+        logError("webrtc", "Relay fallback failed after direct timeout", error);
+      });
+    }, DIRECT_ATTEMPT_TIMEOUT_MS);
   }
 
   function normalizeServerUrl(value) {
@@ -178,6 +298,7 @@
     const connected = Boolean(state.currentPair);
     chatInput.disabled = !state.chatReady;
     sendMessageButton.disabled = !state.chatReady;
+    renderLatencyMetric();
     if (connected) {
       waitingScreen.classList.add("hidden");
       chatScreen.classList.remove("hidden");
@@ -195,6 +316,7 @@
   }
 
   function teardownDataChannel() {
+    stopLatencyPings();
     if (!state.dataChannel) {
       return;
     }
@@ -212,19 +334,82 @@
   }
 
   function teardownPeerConnection() {
+    clearDirectAttemptTimer();
+    clearPairingAttemptTimer();
     teardownDataChannel();
     if (state.peerConnection) {
       try {
         state.peerConnection.onicecandidate = null;
         state.peerConnection.ondatachannel = null;
         state.peerConnection.onconnectionstatechange = null;
+        state.peerConnection.oniceconnectionstatechange = null;
+        state.peerConnection.onicecandidateerror = null;
         state.peerConnection.close();
       } catch (error) {
         logError("webrtc", "Peer connection close failed", error);
       }
     }
     state.peerConnection = null;
+    state.pendingRemoteCandidates = [];
+    state.lastLatencyMs = null;
     state.peerState = state.currentPair ? "Connecting" : "Idle";
+    renderLatencyMetric();
+  }
+
+  function hasRelayFallback() {
+    return state.relayIceServers.length > 0
+      && JSON.stringify(state.relayIceServers) !== JSON.stringify(state.directIceServers);
+  }
+
+  function activeIceServers() {
+    if (state.currentIceMode === "relay" && state.relayIceServers.length) {
+      return state.relayIceServers;
+    }
+    if (state.directIceServers.length) {
+      return state.directIceServers;
+    }
+    return state.relayIceServers;
+  }
+
+  function sendProtocolPayload(payload) {
+    if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+      throw new Error("The direct client channel is not ready yet.");
+    }
+    state.dataChannel.send(JSON.stringify(payload));
+  }
+
+  function scheduleLatencyPing(delay = LATENCY_PING_INTERVAL_MS) {
+    stopLatencyPings();
+    if (!state.chatReady || !state.dataChannel || state.dataChannel.readyState !== "open") {
+      return;
+    }
+    state.latencyPingTimer = window.setTimeout(() => {
+      state.latencyPingTimer = null;
+      const sentAt = performance.now();
+      try {
+        sendProtocolPayload({
+          type: PROTOCOL_TYPE_PING,
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          sent_at: sentAt,
+        });
+      } catch (error) {
+        logError("webrtc", "Failed to send latency ping", error);
+        return;
+      }
+      scheduleLatencyPing(LATENCY_PING_INTERVAL_MS);
+    }, delay);
+  }
+
+  async function promoteToRelayMode(reason) {
+    if (!state.currentPair || state.chatReady || state.currentIceMode === "relay" || !hasRelayFallback()) {
+      return;
+    }
+    log("webrtc", "Promoting to TURN relay mode", { reason });
+    clearDirectAttemptTimer();
+    state.currentIceMode = "relay";
+    setSessionStatus("Direct path failed. Retrying with TURN relay.", "neutral");
+    teardownPeerConnection();
+    renderScreenState();
   }
 
   async function notifyRtcState(peerState) {
@@ -239,17 +424,36 @@
     }
   }
 
+  async function flushPendingIceCandidates(connection) {
+    if (!connection.remoteDescription) {
+      return;
+    }
+    const queuedCandidates = [...state.pendingRemoteCandidates];
+    state.pendingRemoteCandidates = [];
+    for (const candidate of queuedCandidates) {
+      try {
+        await connection.addIceCandidate(candidate);
+        log("signal", "Queued ICE candidate applied");
+      } catch (error) {
+        logError("signal", "Queued ICE candidate rejected", error);
+      }
+    }
+  }
+
   function bindDataChannel(channel) {
     state.dataChannel = channel;
     channel.onopen = async () => {
+      clearDirectAttemptTimer();
+      clearPairingAttemptTimer();
       state.chatReady = true;
       appendChat("system", "Direct peer connection is ready.");
       setSessionStatus("Client connected successfully.", "success");
       renderScreenState();
+      scheduleLatencyPing(LATENCY_PING_INITIAL_DELAY_MS);
       await notifyRtcState("Connected");
     };
     channel.onmessage = (event) => {
-      appendChat("peer", `Client: ${event.data}`);
+      handleProtocolMessage(event.data);
     };
     channel.onclose = async () => {
       state.chatReady = false;
@@ -269,7 +473,12 @@
       return state.peerConnection;
     }
 
-    const connection = new RTCPeerConnection({ iceServers: state.stunServers });
+    const selectedIceServers = activeIceServers();
+    const connection = new RTCPeerConnection({ iceServers: selectedIceServers, iceTransportPolicy: "all" });
+    log("webrtc", "Creating RTCPeerConnection", {
+      mode: state.currentIceMode,
+      iceServers: selectedIceServers,
+    });
     connection.onicecandidate = (event) => {
       if (!event.candidate || !state.socketReady || !state.currentPair) {
         return;
@@ -280,24 +489,41 @@
         signal: {
           kind: "ice_candidate",
           candidate: event.candidate,
+          ice_mode: state.currentIceMode,
         },
       }));
     };
     connection.ondatachannel = (event) => {
       bindDataChannel(event.channel);
     };
+    connection.oniceconnectionstatechange = () => {
+      log("webrtc", "ICE connection state changed", connection.iceConnectionState || "unknown");
+    };
+    connection.onicecandidateerror = (event) => {
+      logError("webrtc", "ICE candidate error", event);
+    };
     connection.onconnectionstatechange = async () => {
       const nextState = connection.connectionState || "unknown";
+      log("webrtc", "Peer connection state changed", nextState);
       if (nextState === "connected") {
+        clearDirectAttemptTimer();
         await notifyRtcState("Connected");
       } else if (nextState === "connecting") {
         await notifyRtcState("Connecting");
       } else if (nextState === "disconnected") {
+        if (!state.chatReady && state.currentIceMode === "direct" && hasRelayFallback()) {
+          await promoteToRelayMode("direct_disconnected");
+          return;
+        }
         await notifyRtcState("Disconnected");
-        setSessionStatus("The client disconnected. Returning to waiting mode.", "error");
+        setSessionStatus("The client connection was interrupted. Resetting the session.", "error");
       } else if (nextState === "failed") {
+        if (!state.chatReady && state.currentIceMode === "direct" && hasRelayFallback()) {
+          await promoteToRelayMode("direct_failed");
+          return;
+        }
         await notifyRtcState("Failed");
-        setSessionStatus("Peer connection failed. Returning to waiting mode.", "error");
+        setSessionStatus("Peer connection failed. Resetting the session.", "error");
       } else if (nextState === "closed") {
         await notifyRtcState("Closed");
       }
@@ -307,53 +533,84 @@
   }
 
   async function handleSignalMessage(payload) {
+    log("signal", "Received signal", payload);
     const fromPeerId = payload.from_peer_id || payload.from_browser_id;
     if (!state.currentPair || fromPeerId !== state.currentPair.peerId) {
       return;
     }
 
     const signal = payload.signal || {};
+    const incomingIceMode = signal.ice_mode === "relay" ? "relay" : "direct";
+    if (signal.kind === "ice_candidate" && incomingIceMode !== state.currentIceMode) {
+      log("webrtc", "Ignoring stale ICE candidate for old mode", {
+        activeMode: state.currentIceMode,
+        candidateMode: incomingIceMode,
+      });
+      return;
+    }
+    if ((signal.kind === "offer" || signal.kind === "answer") && incomingIceMode !== state.currentIceMode) {
+      log("webrtc", "Switching ICE mode from remote signal", {
+        from: state.currentIceMode,
+        to: incomingIceMode,
+        kind: signal.kind,
+      });
+      state.currentIceMode = incomingIceMode;
+      teardownPeerConnection();
+      renderScreenState();
+    }
     let connection = ensurePeerConnection();
 
-    if (signal.kind === "offer") {
-      if (connection.signalingState !== "stable") {
-        teardownPeerConnection();
-        connection = ensurePeerConnection();
-      }
-      await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-      const answer = await connection.createAnswer();
-      await connection.setLocalDescription(answer);
-      state.socket.send(JSON.stringify({
-        type: "signal",
-        target_peer_id: state.currentPair.peerId,
-        signal: {
-          kind: "answer",
-          sdp: answer,
-        },
-      }));
-      state.peerState = "Signaling";
-      return;
-    }
-
-    if (signal.kind === "answer") {
-      if (!connection.localDescription) {
+    try {
+      if (signal.kind === "offer") {
+        if (connection.signalingState !== "stable") {
+          teardownPeerConnection();
+          connection = ensurePeerConnection();
+        }
+        await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        await flushPendingIceCandidates(connection);
+        const answer = await connection.createAnswer();
+        await connection.setLocalDescription(answer);
+        state.socket.send(JSON.stringify({
+          type: "signal",
+          target_peer_id: state.currentPair.peerId,
+          signal: {
+            kind: "answer",
+            sdp: answer,
+            ice_mode: state.currentIceMode,
+          },
+        }));
+        state.peerState = "Signaling";
         return;
       }
-      await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-      return;
-    }
 
-    if (signal.kind === "ice_candidate" && signal.candidate) {
-      try {
-        await connection.addIceCandidate(signal.candidate);
-      } catch (error) {
-        logError("signal", "ICE candidate rejected", error);
+      if (signal.kind === "answer") {
+        if (!connection.localDescription) {
+          return;
+        }
+        await connection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        await flushPendingIceCandidates(connection);
+        return;
       }
+
+      if (signal.kind === "ice_candidate" && signal.candidate) {
+        if (!connection.remoteDescription) {
+          log("signal", "Queueing ICE candidate until remote description is set");
+          state.pendingRemoteCandidates.push(signal.candidate);
+          return;
+        }
+        await connection.addIceCandidate(signal.candidate);
+      }
+    } catch (error) {
+      logError("signal", "Failed to process signal", { signal, error });
+      setSessionStatus("The direct connection signaling failed.", "error");
+      await notifyRtcState("Failed");
     }
   }
 
   async function handlePairingStarted(payload) {
+    log("pairing", "Pairing started", payload);
     teardownPeerConnection();
+    state.currentIceMode = "direct";
     resetChatLog("Client connected. Negotiating direct WebRTC channel.");
     state.currentPair = {
       pairId: payload.pair_id,
@@ -365,16 +622,48 @@
     state.chatReady = false;
     setSessionStatus("Client connected. Negotiating secure direct channel.", "success");
     renderScreenState();
+    startPairingAttemptTimer();
+    startDirectAttemptTimer();
   }
 
   async function handlePairingCleared(payload) {
+    log("pairing", "Pairing cleared", payload);
     teardownPeerConnection();
+    state.currentIceMode = "direct";
     state.currentPair = null;
     state.peerState = "Idle";
     state.chatReady = false;
-    resetChatLog(`Connection ended: ${payload.reason || "peer left"}.`);
+    const reasonLabel = humanizeReason(payload.reason);
+    resetChatLog(`Connection ended because ${reasonLabel}.`);
     renderScreenState();
-    setWaitingStatus(`Online and waiting. ${payload.reason ? `Last session ended: ${payload.reason}.` : ""}`.trim(), "neutral");
+    setWaitingStatus(`Online and waiting. ${payload.reason ? `Last session ended because ${reasonLabel}.` : ""}`.trim(), "neutral");
+  }
+
+  function handleProtocolMessage(raw) {
+    let payload = null;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      appendChat("peer", `Client: ${raw}`);
+      return;
+    }
+
+    if (payload?.type === PROTOCOL_TYPE_CHAT) {
+      appendChat("peer", `Client: ${payload.text || ""}`);
+      return;
+    }
+    if (payload?.type === PROTOCOL_TYPE_PING && payload.id) {
+      try {
+        sendProtocolPayload({ type: PROTOCOL_TYPE_PONG, id: payload.id, sent_at: payload.sent_at });
+      } catch (error) {
+        logError("webrtc", "Failed to respond to ping", error);
+      }
+      return;
+    }
+    if (payload?.type === PROTOCOL_TYPE_PONG && typeof payload.sent_at === "number") {
+      state.lastLatencyMs = Math.max(0, Math.round(performance.now() - payload.sent_at));
+      renderLatencyMetric();
+    }
   }
 
   async function loadConfig() {
@@ -407,10 +696,19 @@
 
   async function loadBackendConfig() {
     const data = await fetchJson(apiUrl("/api/config"));
-    state.stunServers = data.stun_servers || [];
+    state.directIceServers = data.direct_ice_servers || [];
+    state.relayIceServers = data.ice_servers || data.stun_servers || [];
+    state.stunServers = state.directIceServers.length ? state.directIceServers : state.relayIceServers;
+    log("webrtc", "Loaded ICE config", {
+      source: data.ice_source || "unknown",
+      directCount: state.directIceServers.length,
+      relayCount: state.relayIceServers.length,
+    });
   }
 
   function stopSocket() {
+    clearDirectAttemptTimer();
+    clearPairingAttemptTimer();
     if (state.socket) {
       try {
         state.socket.onclose = null;
@@ -438,6 +736,7 @@
   }
 
   async function openSocket(forceReconnect = false) {
+    log("socket", "Open socket requested", { forceReconnect });
     if (state.socket && state.socketReady && !forceReconnect) {
       return;
     }
@@ -447,6 +746,7 @@
     state.socket = socket;
 
     socket.onopen = () => {
+      log("socket", "WebSocket opened");
       clearReconnectTimer();
       state.reconnectDelayMs = 2000;
       state.socketReady = true;
@@ -473,6 +773,7 @@
         return;
       }
       if (payload.type === "error") {
+        clearPairingAttemptTimer();
         if (state.currentPair) {
           setSessionStatus(payload.message || "An error occurred.", "error");
         } else {
@@ -482,9 +783,11 @@
     };
 
     socket.onclose = async (event) => {
+      log("socket", "WebSocket closed", { code: event.code, reason: event.reason });
       stopHeartbeat();
       state.socketReady = false;
       state.socket = null;
+      clearPairingAttemptTimer();
       if (state.currentPair) {
         await handlePairingCleared({ reason: "signaling_socket_closed" });
       }
@@ -593,7 +896,7 @@
   }
 
   function sendMessage() {
-    const text = chatInput.value.trim();
+    const text = chatInput.value.trim().slice(0, MAX_CHAT_MESSAGE_LENGTH);
     if (!text) {
       return;
     }
@@ -601,7 +904,7 @@
       setSessionStatus("The direct client channel is not ready yet.", "error");
       return;
     }
-    state.dataChannel.send(text);
+    sendProtocolPayload({ type: PROTOCOL_TYPE_CHAT, text });
     appendChat("self", `You: ${text}`);
     chatInput.value = "";
   }

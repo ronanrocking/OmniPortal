@@ -1,7 +1,12 @@
 import asyncio
+import json
+import logging
 import os
 import re
 import time
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -39,14 +44,28 @@ BROWSER_COOKIE = "omni_browser_id"
 HEARTBEAT_TIMEOUT_SECONDS = 45
 DISCONNECTED_SESSION_GRACE_SECONDS = 30
 CLEANUP_INTERVAL_SECONDS = 10
+PAIRING_SIGNAL_TIMEOUT_SECONDS = 30
+VALID_PAIRING_STATES = {"signaling", "connecting", "connected", "disconnected", "failed", "closed"}
 
 DEFAULT_STUN_SERVERS = [
     {"urls": ["stun:stun.l.google.com:19302"]},
     {"urls": ["stun:stun1.l.google.com:19302"]},
 ]
+DEFAULT_OPENRELAY_STUN_URI = "stun:openrelay.metered.ca:80"
+DEFAULT_OPENRELAY_TURN_URIS = [
+    "turn:openrelay.metered.ca:80",
+    "turn:openrelay.metered.ca:443",
+    "turn:openrelay.metered.ca:443?transport=tcp",
+]
+DEFAULT_OPENRELAY_USERNAME = "openrelayproject"
+DEFAULT_OPENRELAY_CREDENTIAL = "openrelayproject"
+DEFAULT_METERED_CACHE_TTL_SECONDS = 300
 
 HOST_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,80}$")
 HOST_CODE_PATTERN = re.compile(r"^\d{6}$")
+
+logging.basicConfig(level=os.getenv("OMNI_LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("omniportal.backend")
 
 app = FastAPI()
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
@@ -60,6 +79,12 @@ LIVE_BROWSER_HOST_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
 LIVE_INSTALLED_HOST_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
 PAIRINGS: Dict[str, Dict[str, Any]] = {}
 CLEANUP_TASK: Optional[asyncio.Task[Any]] = None
+ICE_CONFIG_CACHE: Dict[str, Any] = {
+    "servers": None,
+    "source": None,
+    "expires_at": 0.0,
+}
+ICE_CACHE_LOCK = RLock()
 
 
 class HostRegisterRequest(BaseModel):
@@ -108,6 +133,199 @@ def configured_stun_servers() -> List[Dict[str, Any]]:
     return servers or DEFAULT_STUN_SERVERS
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_ice_server(url: str, username: Optional[str] = None, credential: Optional[str] = None) -> Dict[str, Any]:
+    server: Dict[str, Any] = {"urls": [url]}
+    if username:
+        server["username"] = username
+    if credential:
+        server["credential"] = credential
+    return server
+
+
+def parse_ice_servers_json(raw: str) -> List[Dict[str, Any]]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        logger.warning("Invalid OMNI_ICE_SERVERS_JSON; falling back to env-based ICE config: %s", error)
+        return []
+
+    if not isinstance(parsed, list):
+        logger.warning("OMNI_ICE_SERVERS_JSON must be a JSON array; falling back to env-based ICE config")
+        return []
+
+    servers: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        urls = item.get("urls")
+        username = item.get("username")
+        credential = item.get("credential")
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list):
+            continue
+        normalized_urls = [str(url).strip() for url in urls if str(url).strip()]
+        if not normalized_urls:
+            continue
+        server: Dict[str, Any] = {"urls": normalized_urls}
+        if isinstance(username, str) and username.strip():
+            server["username"] = username.strip()
+        if isinstance(credential, str) and credential.strip():
+            server["credential"] = credential.strip()
+        servers.append(server)
+    return servers
+
+
+def parse_ice_servers_payload(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+    return parse_ice_servers_json(json.dumps(payload))
+
+
+def normalized_server_urls(server: Dict[str, Any]) -> List[str]:
+    urls = server.get("urls")
+    if isinstance(urls, str):
+        return [urls.strip()] if urls.strip() else []
+    if isinstance(urls, list):
+        return [str(url).strip() for url in urls if str(url).strip()]
+    return []
+
+
+def is_turn_url(url: str) -> bool:
+    normalized = url.strip().lower()
+    return normalized.startswith("turn:") or normalized.startswith("turns:")
+
+
+def direct_ice_servers(ice_servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    direct_servers: List[Dict[str, Any]] = []
+    for server in ice_servers:
+        urls = [url for url in normalized_server_urls(server) if not is_turn_url(url)]
+        if not urls:
+            continue
+        direct_servers.append({"urls": urls})
+    return direct_servers
+
+
+def metered_cache_ttl_seconds() -> int:
+    raw = os.getenv("OMNI_METERED_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_METERED_CACHE_TTL_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid OMNI_METERED_CACHE_TTL_SECONDS=%s; using default cache TTL", raw)
+        return DEFAULT_METERED_CACHE_TTL_SECONDS
+
+
+def configured_metered_api_ice_servers() -> List[Dict[str, Any]]:
+    app_name = os.getenv("OMNI_METERED_APP_NAME", "").strip()
+    credential_api_key = os.getenv("OMNI_METERED_CREDENTIAL_API_KEY", "").strip()
+    if not app_name or not credential_api_key:
+        return []
+
+    ttl_seconds = metered_cache_ttl_seconds()
+    now = monotonic_now()
+    with ICE_CACHE_LOCK:
+        cached_servers = ICE_CONFIG_CACHE.get("servers")
+        cached_source = ICE_CONFIG_CACHE.get("source")
+        expires_at = float(ICE_CONFIG_CACHE.get("expires_at") or 0.0)
+        if cached_source == "metered_api" and isinstance(cached_servers, list) and now < expires_at:
+            return [dict(server) for server in cached_servers]
+
+    query_params = {"apiKey": credential_api_key}
+    region = os.getenv("OMNI_METERED_REGION", "").strip()
+    normalized_region = region.lower()
+    if region and normalized_region not in {"standard", "free"}:
+        query_params["region"] = region
+
+    url = f"https://{app_name}.metered.live/api/v1/turn/credentials?{urlencode(query_params)}"
+    timeout_seconds = float(os.getenv("OMNI_METERED_FETCH_TIMEOUT_SECONDS", "5").strip() or "5")
+    log_context = {
+        "app_name": app_name,
+        "region": region or "default",
+    }
+    try:
+        with urlopen(url, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (URLError, TimeoutError, json.JSONDecodeError, ValueError) as error:
+        logger.warning("metered_ice_fetch_failed app=%s region=%s error=%s", log_context["app_name"], log_context["region"], error)
+        return []
+
+    servers = parse_ice_servers_payload(payload)
+    if not servers:
+        logger.warning("metered_ice_fetch_empty app=%s region=%s", log_context["app_name"], log_context["region"])
+        return []
+
+    with ICE_CACHE_LOCK:
+        ICE_CONFIG_CACHE["servers"] = [dict(server) for server in servers]
+        ICE_CONFIG_CACHE["source"] = "metered_api"
+        ICE_CONFIG_CACHE["expires_at"] = monotonic_now() + ttl_seconds
+    logger.info("metered_ice_fetch_ok app=%s region=%s count=%s", log_context["app_name"], log_context["region"], len(servers))
+    return servers
+
+
+def configured_turn_servers() -> List[Dict[str, Any]]:
+    raw_turn_uris = os.getenv("OMNI_TURN_URIS", "").strip()
+    if not raw_turn_uris:
+        return []
+
+    username = os.getenv("OMNI_TURN_USERNAME", "").strip()
+    credential = os.getenv("OMNI_TURN_CREDENTIAL", "").strip()
+    if not username or not credential:
+        logger.warning("OMNI_TURN_URIS is set, but OMNI_TURN_USERNAME or OMNI_TURN_CREDENTIAL is missing; skipping TURN URIs")
+        return []
+
+    servers: List[Dict[str, Any]] = []
+    for item in raw_turn_uris.split(","):
+        url = item.strip()
+        if url:
+            servers.append(build_ice_server(url, username=username, credential=credential))
+    return servers
+
+
+def configured_openrelay_ice_servers() -> List[Dict[str, Any]]:
+    stun_uri = os.getenv("OMNI_OPENRELAY_STUN_URI", DEFAULT_OPENRELAY_STUN_URI).strip() or DEFAULT_OPENRELAY_STUN_URI
+    raw_turn_uris = os.getenv("OMNI_OPENRELAY_TURN_URIS", ",".join(DEFAULT_OPENRELAY_TURN_URIS)).strip()
+    username = os.getenv("OMNI_OPENRELAY_USERNAME", DEFAULT_OPENRELAY_USERNAME).strip() or DEFAULT_OPENRELAY_USERNAME
+    credential = os.getenv("OMNI_OPENRELAY_CREDENTIAL", DEFAULT_OPENRELAY_CREDENTIAL).strip() or DEFAULT_OPENRELAY_CREDENTIAL
+
+    servers = [build_ice_server(stun_uri)]
+    for item in raw_turn_uris.split(","):
+        url = item.strip()
+        if url:
+            servers.append(build_ice_server(url, username=username, credential=credential))
+    return servers
+
+
+def configured_ice_servers() -> Tuple[List[Dict[str, Any]], str]:
+    metered_servers = configured_metered_api_ice_servers()
+    if metered_servers:
+        return metered_servers, "metered_api"
+
+    raw_ice_servers = os.getenv("OMNI_ICE_SERVERS_JSON", "").strip()
+    if raw_ice_servers:
+        ice_servers = parse_ice_servers_json(raw_ice_servers)
+        if ice_servers:
+            return ice_servers, "static_ice_json"
+
+    ice_servers = configured_stun_servers()
+    turn_servers = configured_turn_servers()
+    if turn_servers:
+        return [*ice_servers, *turn_servers], "stun_turn_env"
+
+    if env_flag("OMNI_USE_OPENRELAY", False):
+        return configured_openrelay_ice_servers(), "openrelay_default"
+
+    return ice_servers, "stun_only"
+
+
 def normalize_host_name(host_name: str) -> str:
     value = " ".join(host_name.strip().split())
     if not value:
@@ -148,6 +366,13 @@ def normalize_host_code(host_code: str) -> str:
     value = host_code.strip()
     if not HOST_CODE_PATTERN.match(value):
         raise HTTPException(status_code=400, detail="host_code must be exactly 6 numeric digits")
+    return value
+
+
+def normalize_pairing_state(state_value: str) -> str:
+    value = state_value.strip().lower()
+    if value not in VALID_PAIRING_STATES:
+        raise HTTPException(status_code=400, detail="rtc_state is invalid")
     return value
 
 
@@ -555,6 +780,12 @@ def create_pairing(host_connect_id: str, client_browser_id: str) -> Dict[str, An
     with STATE_LOCK:
         PAIRINGS[host_connect_id] = dict(pairing)
         PAIRINGS[client_browser_id] = dict(pairing)
+    logger.info(
+        "pairing_created pair_id=%s host=%s client=%s",
+        pairing["pair_id"],
+        host_connect_id,
+        client_browser_id,
+    )
     return pairing
 
 
@@ -636,7 +867,8 @@ async def send_json_safe(websocket: Optional[WebSocket], payload: Dict[str, Any]
         return
     try:
         await websocket.send_json(payload)
-    except Exception:
+    except Exception as error:
+        logger.warning("websocket_send_failed payload_type=%s error=%s", payload.get("type"), error)
         return
 
 
@@ -645,7 +877,8 @@ async def close_socket_safe(websocket: Optional[WebSocket], code: int, reason: s
         return
     try:
         await websocket.close(code=code, reason=reason)
-    except Exception:
+    except Exception as error:
+        logger.warning("websocket_close_failed code=%s reason=%s error=%s", code, reason, error)
         return
 
 
@@ -663,6 +896,14 @@ async def clear_pairing_and_notify(peer_id: str, reason: str, initiator: Optiona
     pairing = clear_pairing_for_peer(peer_id)
     if pairing is None:
         return
+    logger.info(
+        "pairing_cleared pair_id=%s reason=%s initiator=%s host=%s client=%s",
+        pairing["pair_id"],
+        reason,
+        initiator,
+        pairing["host_connect_id"],
+        pairing["client_browser_id"],
+    )
 
     payload = {
         "type": "pairing_cleared",
@@ -676,14 +917,19 @@ async def clear_pairing_and_notify(peer_id: str, reason: str, initiator: Optiona
 
 
 async def mark_pairing_state(peer_id: str, state_value: str) -> None:
+    normalized_state = normalize_pairing_state(state_value)
     with STATE_LOCK:
         pairing = PAIRINGS.get(peer_id)
         if pairing is None:
             return
         now = utc_now_iso()
         for participant in (pairing["host_connect_id"], pairing["client_browser_id"]):
-            PAIRINGS[participant]["state"] = state_value
+            PAIRINGS[participant]["state"] = normalized_state
             PAIRINGS[participant]["updated_at"] = now
+    logger.info("pairing_state_changed pair_id=%s peer=%s state=%s", pairing["pair_id"], peer_id, normalized_state)
+    if normalized_state in {"failed", "disconnected", "closed"}:
+        await clear_pairing_and_notify(peer_id, f"rtc_{normalized_state}", initiator=peer_id)
+        return
     await broadcast_system_state()
 
 
@@ -726,6 +972,7 @@ async def connect_browser_websocket(browser_id: str, role: str, websocket: WebSo
             session["updated_at"] = now_iso
             session["disconnected_at"] = None
 
+    logger.info("browser_socket_connected browser_id=%s role=%s", browser_id, role)
     await close_socket_safe(previous_socket, 4000, "Superseded by a newer connection.")
     await broadcast_system_state()
 
@@ -752,6 +999,7 @@ async def connect_installed_host_websocket(host_id: str, websocket: WebSocket) -
             host["disconnected_at"] = None
             host["last_online"] = now_iso
 
+    logger.info("host_socket_connected host_id=%s", host_id)
     await close_socket_safe(previous_socket, 4000, "Superseded by a newer connection.")
     await broadcast_system_state()
 
@@ -795,6 +1043,7 @@ async def expire_browser_connection(browser_id: str, reason: str, role: Optional
             session["disconnected_at"] = now_iso
 
     participant_id = browser_id if resolved_role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+    logger.info("browser_socket_expired browser_id=%s role=%s reason=%s", browser_id, resolved_role, reason)
     await clear_pairing_and_notify(participant_id, reason, initiator=participant_id)
     if websocket is None:
         await close_socket_safe(socket_to_close, 4001, reason)
@@ -819,6 +1068,7 @@ async def expire_installed_host_connection(host_id: str, reason: str, websocket:
             host["disconnected_at"] = now_iso
 
     participant_id = installed_host_connect_id(host_id)
+    logger.info("host_socket_expired host_id=%s reason=%s", host_id, reason)
     await clear_pairing_and_notify(participant_id, reason, initiator=participant_id)
     if websocket is None:
         await close_socket_safe(socket_to_close, 4001, reason)
@@ -830,6 +1080,7 @@ async def cleanup_stale_state() -> None:
     stale_browser_hosts: List[str] = []
     stale_installed_hosts: List[str] = []
     stale_sessions: List[str] = []
+    stale_pair_participants: List[str] = []
     now_monotonic = monotonic_now()
 
     with STATE_LOCK:
@@ -852,12 +1103,26 @@ async def cleanup_stale_state() -> None:
             if disconnected_at and iso_age_seconds(disconnected_at) > DISCONNECTED_SESSION_GRACE_SECONDS:
                 stale_sessions.append(browser_id)
 
+        seen_pair_ids = set()
+        for participant_id, pairing in PAIRINGS.items():
+            if participant_id != pairing["host_connect_id"]:
+                continue
+            if pairing["pair_id"] in seen_pair_ids:
+                continue
+            seen_pair_ids.add(pairing["pair_id"])
+            if pairing["state"] == "connected":
+                continue
+            if iso_age_seconds(pairing["updated_at"]) > PAIRING_SIGNAL_TIMEOUT_SECONDS:
+                stale_pair_participants.append(participant_id)
+
     for browser_id in stale_clients:
         await expire_browser_connection(browser_id, "heartbeat_timeout", role=ROLE_CLIENT)
     for browser_id in stale_browser_hosts:
         await expire_browser_connection(browser_id, "heartbeat_timeout", role=ROLE_HOST)
     for host_id in stale_installed_hosts:
         await expire_installed_host_connection(host_id, "heartbeat_timeout")
+    for participant_id in stale_pair_participants:
+        await clear_pairing_and_notify(participant_id, "pairing_timeout", initiator=participant_id)
 
     if stale_sessions:
         with STATE_LOCK:
@@ -991,7 +1256,14 @@ def get_status() -> Dict[str, Any]:
 
 @app.get("/api/config")
 def get_config() -> Dict[str, Any]:
-    return {"stun_servers": configured_stun_servers()}
+    ice_servers, ice_source = configured_ice_servers()
+    direct_servers = direct_ice_servers(ice_servers)
+    return {
+        "ice_servers": ice_servers,
+        "direct_ice_servers": direct_servers,
+        "stun_servers": ice_servers,
+        "ice_source": ice_source,
+    }
 
 
 @app.get("/api/me")
@@ -1022,6 +1294,13 @@ async def register_host(payload: HostRegisterRequest, request: Request, response
 @app.post("/api/host-v1/register")
 async def register_host_v1(payload: HostV1RegisterRequest) -> Dict[str, Any]:
     host = upsert_installed_host_state(payload)
+    logger.info(
+        "host_registered host_id=%s host_code=%s display_name=%s device_name=%s",
+        host["host_id"],
+        host["host_code"],
+        host["display_name"],
+        host["device_name"],
+    )
     await broadcast_system_state()
     return {"host": host_payload(host)}
 
@@ -1029,6 +1308,7 @@ async def register_host_v1(payload: HostV1RegisterRequest) -> Dict[str, Any]:
 @app.post("/api/client/join")
 async def join_client(request: Request, response: Response) -> Dict[str, Any]:
     browser_id = ensure_browser_id(request)
+    logger.info("client_join_requested browser_id=%s", browser_id)
 
     await clear_pairing_and_notify(browser_id, "role_changed", initiator=browser_id)
     await clear_pairing_and_notify(browser_host_connect_id(browser_id), "role_changed", initiator=browser_host_connect_id(browser_id))
@@ -1044,6 +1324,7 @@ async def join_client(request: Request, response: Response) -> Dict[str, Any]:
 @app.post("/api/session/reset")
 async def reset_session(request: Request, response: Response) -> Dict[str, Any]:
     browser_id = ensure_browser_id(request)
+    logger.info("session_reset_requested browser_id=%s", browser_id)
 
     await clear_pairing_and_notify(browser_id, "session_reset", initiator=browser_id)
     await clear_pairing_and_notify(browser_host_connect_id(browser_id), "session_reset", initiator=browser_host_connect_id(browser_id))
@@ -1075,6 +1356,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     await websocket.accept()
     await connect_browser_websocket(browser_id, role, websocket)
+    logger.info("browser_socket_accepted browser_id=%s role=%s", browser_id, role)
 
     session = current_session(browser_id)
     await send_json_safe(
@@ -1126,28 +1408,45 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit host PIN is required."})
                     continue
                 if not isinstance(connect_id, str) or not connect_id:
-                    await send_json_safe(websocket, {"type": "error", "message": "A valid host identifier is required."})
+                    logger.info("pairing_rejected_no_host browser_id=%s host_code=%s", browser_id, normalized_requested_code)
+                    await send_json_safe(websocket, {"type": "error", "message": "No online host was found for that PIN."})
                     continue
 
                 await clear_pairing_and_notify(browser_id, "replaced_by_new_pair", initiator=browser_id)
                 is_available, error_message = validate_host_availability(connect_id)
                 if not is_available:
+                    logger.info(
+                        "pairing_rejected_unavailable browser_id=%s host=%s host_code=%s reason=%s",
+                        browser_id,
+                        connect_id,
+                        normalized_requested_code,
+                        error_message,
+                    )
                     await send_json_safe(websocket, {"type": "error", "message": error_message})
                     await send_json_safe(websocket, {"type": "hosts_snapshot", "hosts": list_client_visible_hosts()})
                     continue
 
                 host = get_host_record_by_connect_id(connect_id)
                 if host is None:
+                    logger.info("pairing_rejected_missing_host browser_id=%s host=%s", browser_id, connect_id)
                     await send_json_safe(websocket, {"type": "error", "message": "Selected host does not exist."})
                     continue
 
                 if host.get("host_code") != normalized_requested_code:
+                    logger.info(
+                        "pairing_rejected_code_mismatch browser_id=%s host=%s requested=%s actual=%s",
+                        browser_id,
+                        connect_id,
+                        normalized_requested_code,
+                        host.get("host_code"),
+                    )
                     await send_json_safe(websocket, {"type": "error", "message": "The host PIN did not match the selected host."})
                     continue
 
                 pairing = create_pairing(connect_id, browser_id)
                 host_socket = get_live_socket_for_peer(connect_id)
                 if host_socket is None:
+                    logger.info("pairing_rejected_host_offline browser_id=%s host=%s", browser_id, connect_id)
                     await clear_pairing_and_notify(browser_id, "host_went_offline", initiator=connect_id)
                     await send_json_safe(websocket, {"type": "error", "message": "Selected host went offline."})
                     continue
@@ -1173,7 +1472,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_json_safe(websocket, {"type": "error", "message": "A valid RTC state is required."})
                     continue
                 participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
-                await mark_pairing_state(participant_id, state_value)
+                try:
+                    await mark_pairing_state(participant_id, state_value)
+                except HTTPException as error:
+                    await send_json_safe(websocket, {"type": "error", "message": error.detail})
                 continue
 
             if message_type == "signal":
@@ -1212,11 +1514,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "signal": signal,
                     },
                 )
+                logger.info("signal_relayed source=%s target=%s kind=%s", participant_id, target_peer_id, signal.get("kind"))
                 continue
 
             await send_json_safe(websocket, {"type": "error", "message": "Unsupported message type."})
     except WebSocketDisconnect:
-        pass
+        logger.info("browser_socket_disconnected browser_id=%s role=%s", browser_id, role)
+    except Exception as error:
+        logger.exception("browser_socket_failed browser_id=%s role=%s error=%s", browser_id, role, error)
     finally:
         await expire_browser_connection(browser_id, "peer_disconnected", role=role, websocket=websocket)
 
@@ -1232,6 +1537,7 @@ async def host_v1_websocket_endpoint(websocket: WebSocket, host_id: str = Query(
 
     await websocket.accept()
     await connect_installed_host_websocket(normalized_host_id, websocket)
+    logger.info("host_socket_accepted host_id=%s", normalized_host_id)
     await send_json_safe(
         websocket,
         {
@@ -1262,7 +1568,10 @@ async def host_v1_websocket_endpoint(websocket: WebSocket, host_id: str = Query(
                 if not isinstance(state_value, str) or not state_value:
                     await send_json_safe(websocket, {"type": "error", "message": "A valid RTC state is required."})
                     continue
-                await mark_pairing_state(installed_host_connect_id(normalized_host_id), state_value)
+                try:
+                    await mark_pairing_state(installed_host_connect_id(normalized_host_id), state_value)
+                except HTTPException as error:
+                    await send_json_safe(websocket, {"type": "error", "message": error.detail})
                 continue
 
             if message_type == "signal":
@@ -1296,10 +1605,13 @@ async def host_v1_websocket_endpoint(websocket: WebSocket, host_id: str = Query(
                         "signal": signal,
                     },
                 )
+                logger.info("signal_relayed source=%s target=%s kind=%s", participant_id, target_peer_id, signal.get("kind"))
                 continue
 
             await send_json_safe(websocket, {"type": "error", "message": "Unsupported message type."})
     except WebSocketDisconnect:
-        pass
+        logger.info("host_socket_disconnected host_id=%s", normalized_host_id)
+    except Exception as error:
+        logger.exception("host_socket_failed host_id=%s error=%s", normalized_host_id, error)
     finally:
         await expire_installed_host_connection(normalized_host_id, "peer_disconnected", websocket=websocket)
