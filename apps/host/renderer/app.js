@@ -32,6 +32,7 @@
     pendingRemoteCandidates: [],
     latencyPingTimer: null,
     lastLatencyMs: null,
+    iceSource: null,
   };
 
   const waitingScreen = document.getElementById("waitingScreen");
@@ -42,6 +43,7 @@
   const hostCodeValue = document.getElementById("hostCodeValue");
   const deviceNameValue = document.getElementById("deviceNameValue");
   const serverUrlValue = document.getElementById("serverUrlValue");
+  const iceSourceValue = document.getElementById("iceSourceValue");
   const hostIdValue = document.getElementById("hostIdValue");
   const sessionTitle = document.getElementById("sessionTitle");
   const sessionSubtitle = document.getElementById("sessionSubtitle");
@@ -284,6 +286,7 @@
       hostCodeValue.textContent = "Loading...";
       deviceNameValue.textContent = "Loading...";
       serverUrlValue.textContent = "Loading...";
+      iceSourceValue.textContent = "Loading...";
       hostIdValue.textContent = "Loading...";
       return;
     }
@@ -291,7 +294,27 @@
     hostCodeValue.textContent = state.config.host_code;
     deviceNameValue.textContent = state.runtime.deviceName;
     serverUrlValue.textContent = state.config.server_url;
+    iceSourceValue.textContent = humanizeIceSource(state.iceSource);
     hostIdValue.textContent = state.config.host_id;
+  }
+
+  function humanizeIceSource(source) {
+    switch (source) {
+      case "metered_api":
+        return "Metered credential API";
+      case "static_ice_json":
+        return "Pinned static ICE JSON";
+      case "turn_rest_env":
+        return "Self-hosted TURN with temporary credentials";
+      case "stun_turn_env":
+        return "Custom TURN with static credentials";
+      case "openrelay_default":
+        return "OpenRelay public fallback";
+      case "stun_only":
+        return "Direct STUN only";
+      default:
+        return "Loading backend relay policy...";
+    }
   }
 
   function renderScreenState() {
@@ -699,11 +722,13 @@
     state.directIceServers = data.direct_ice_servers || [];
     state.relayIceServers = data.ice_servers || data.stun_servers || [];
     state.stunServers = state.directIceServers.length ? state.directIceServers : state.relayIceServers;
+    state.iceSource = data.ice_source || "unknown";
     log("webrtc", "Loaded ICE config", {
-      source: data.ice_source || "unknown",
+      source: state.iceSource,
       directCount: state.directIceServers.length,
       relayCount: state.relayIceServers.length,
     });
+    renderDetails();
   }
 
   function stopSocket() {

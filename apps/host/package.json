@@ -1,6 +1,6 @@
 {
   "name": "omniportal-host",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Electron Host V1 application for OmniPortal",
   "main": "main.js",
   "author": "OmniPortal",

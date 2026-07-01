@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -60,6 +63,7 @@ DEFAULT_OPENRELAY_TURN_URIS = [
 DEFAULT_OPENRELAY_USERNAME = "openrelayproject"
 DEFAULT_OPENRELAY_CREDENTIAL = "openrelayproject"
 DEFAULT_METERED_CACHE_TTL_SECONDS = 300
+DEFAULT_TURN_REST_TTL_SECONDS = 3600
 
 HOST_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,80}$")
 HOST_CODE_PATTERN = re.compile(r"^\d{6}$")
@@ -290,6 +294,37 @@ def configured_turn_servers() -> List[Dict[str, Any]]:
     return servers
 
 
+def turn_rest_ttl_seconds() -> int:
+    raw = os.getenv("OMNI_TURN_REST_TTL_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_TURN_REST_TTL_SECONDS
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        logger.warning("Invalid OMNI_TURN_REST_TTL_SECONDS=%s; using default TURN REST TTL", raw)
+        return DEFAULT_TURN_REST_TTL_SECONDS
+
+
+def configured_turn_rest_servers() -> List[Dict[str, Any]]:
+    raw_turn_uris = os.getenv("OMNI_TURN_URIS", "").strip()
+    shared_secret = os.getenv("OMNI_TURN_REST_SECRET", "").strip()
+    if not raw_turn_uris or not shared_secret:
+        return []
+
+    username_suffix = os.getenv("OMNI_TURN_REST_USERNAME_PREFIX", "omniportal").strip() or "omniportal"
+    expiry_timestamp = int(time.time()) + turn_rest_ttl_seconds()
+    username = f"{expiry_timestamp}:{username_suffix}"
+    digest = hmac.new(shared_secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1).digest()
+    credential = base64.b64encode(digest).decode("utf-8")
+
+    servers: List[Dict[str, Any]] = []
+    for item in raw_turn_uris.split(","):
+        url = item.strip()
+        if url:
+            servers.append(build_ice_server(url, username=username, credential=credential))
+    return servers
+
+
 def configured_openrelay_ice_servers() -> List[Dict[str, Any]]:
     stun_uri = os.getenv("OMNI_OPENRELAY_STUN_URI", DEFAULT_OPENRELAY_STUN_URI).strip() or DEFAULT_OPENRELAY_STUN_URI
     raw_turn_uris = os.getenv("OMNI_OPENRELAY_TURN_URIS", ",".join(DEFAULT_OPENRELAY_TURN_URIS)).strip()
@@ -316,6 +351,10 @@ def configured_ice_servers() -> Tuple[List[Dict[str, Any]], str]:
             return ice_servers, "static_ice_json"
 
     ice_servers = configured_stun_servers()
+    turn_rest_servers = configured_turn_rest_servers()
+    if turn_rest_servers:
+        return [*ice_servers, *turn_rest_servers], "turn_rest_env"
+
     turn_servers = configured_turn_servers()
     if turn_servers:
         return [*ice_servers, *turn_servers], "stun_turn_env"
