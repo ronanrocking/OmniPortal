@@ -20,7 +20,7 @@ function renderEmpty(element, message) {
 
 function renderHosts(hosts) {
   if (!hosts.length) {
-    renderEmpty(hostsList, "No connected hosts yet.");
+    renderEmpty(hostsList, "No reachable browsers yet.");
     return;
   }
   hostsList.innerHTML = hosts.map((host) => `
@@ -40,15 +40,16 @@ function renderHosts(hosts) {
 
 function renderClients(clients) {
   if (!clients.length) {
-    renderEmpty(clientsList, "No connected clients yet.");
+    renderEmpty(clientsList, "No live browser sessions yet.");
     return;
   }
   clientsList.innerHTML = clients.map((client) => `
     <div class="item-card">
-      <strong>Client Session</strong>
+      <strong>Browser Session</strong>
       <div class="tiny-note">Connected: ${formatTime(client.connected_at)}</div>
       <div class="tiny-note mono">${client.browser_id}</div>
       <div class="pill-row">
+        ${client.peer_code ? `<span class="pill host">Code ${client.peer_code}</span>` : ""}
         <span class="pill client">${client.paired ? "Paired" : "Idle"}</span>
         ${client.peer_display_name ? `<span class="pill host">${client.peer_display_name}</span>` : ""}
       </div>
@@ -58,7 +59,7 @@ function renderClients(clients) {
 
 function renderConnections(connections) {
   if (!connections.length) {
-    renderEmpty(connectionsList, "No host/client pairings are active.");
+    renderEmpty(connectionsList, "No browser pairings are active.");
     return;
   }
   connectionsList.innerHTML = connections.map((connection) => `

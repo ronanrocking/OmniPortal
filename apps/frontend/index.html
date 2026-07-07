@@ -4,28 +4,106 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OmniPortal</title>
-  <link rel="stylesheet" href="/frontend/styles.css">
+  <link rel="stylesheet" href="/frontend/styles.css?v=20260707b">
 </head>
 <body>
-  <main class="page-shell">
+  <main class="page-shell unified-shell">
     <section class="hero-card">
-      <span class="eyebrow">OmniPortal</span>
-      <h1>Use this browser as a client.</h1>
-      <p class="hero-copy">Browser hosting has been retired. Hosts now run through the installed OmniPortal Host desktop app, while this web frontend stays focused on client access and read-only admin visibility.</p>
-
-      <div class="choice-grid">
-        <a class="choice-card" href="/client">
-          <span class="choice-badge client">Client</span>
-          <h2>Become a client</h2>
-          <p>Browse connected desktop hosts, choose one, and start a direct WebRTC chat session.</p>
-        </a>
+      <div class="hero-topline">
+        <div>
+          <span class="eyebrow">OmniPortal</span>
+          <h1>One page, two browsers, one live session.</h1>
+          <p class="hero-copy">Every browser session gets its own 6-digit code. Share your code or enter someone else&apos;s code to connect. Once paired, the communication section unlocks for chat, voice, or video.</p>
+        </div>
+        <div class="admin-link-row">
+          <span class="tiny-note">Read-only admin dashboard:</span>
+          <a class="text-link" href="/admin">/admin</a>
+        </div>
       </div>
 
-      <div class="admin-link-row">
-        <span class="tiny-note">Read-only admin dashboard:</span>
-        <a class="text-link" href="/admin">/admin</a>
+      <div class="pairing-grid">
+        <article class="pair-card">
+          <span class="section-label">Your code</span>
+          <div class="code-display mono" id="myCodeValue">......</div>
+          <p class="tiny-note">Keep this page open while another browser connects to this code.</p>
+        </article>
+
+        <article class="pair-card">
+          <span class="section-label">Join another browser</span>
+          <div class="join-row">
+            <input id="joinCodeInput" class="pin-input compact" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" aria-label="6 digit browser code">
+            <button class="primary-button" id="connectButton">Connect</button>
+          </div>
+          <div class="button-row">
+            <button class="secondary-button" id="disconnectButton" disabled>Disconnect</button>
+            <button class="secondary-button" id="resetSessionButton">Reset Session</button>
+          </div>
+          <p class="tiny-note" id="peerSummary">No browser connected yet.</p>
+        </article>
+      </div>
+
+      <div class="status-box" id="statusBox">Preparing your browser session...</div>
+    </section>
+
+    <section class="comm-section locked" id="communicationSection" aria-disabled="true">
+      <div class="comm-lock-note" id="commLockNote">Connect two browsers first to unlock chat, voice, and video.</div>
+
+      <div class="comm-header">
+        <div>
+          <span class="eyebrow">Communication</span>
+          <h2 id="commTitle">Choose a mode after pairing</h2>
+          <p class="tiny-note" id="commSubtitle">The peer connection is not active yet.</p>
+        </div>
+        <div class="mode-row">
+          <button class="secondary-button mode-button" id="chatModeButton">Chat</button>
+          <button class="secondary-button mode-button" id="voiceModeButton">Voice</button>
+          <button class="secondary-button mode-button" id="videoModeButton">Video</button>
+        </div>
+      </div>
+
+      <div class="status-line session-line" id="sessionStatusBox">Waiting for a peer connection.</div>
+
+      <div class="comm-body">
+        <section class="chat-shell hidden" id="chatPanel">
+          <div class="chat-log" id="chatLog">
+            <div class="chat-row system">Select Chat after the peer connection is ready.</div>
+          </div>
+          <div class="chat-compose">
+            <input id="chatInput" maxlength="400" placeholder="Type a message to the connected browser" disabled>
+            <button class="primary-button" id="sendMessageButton" disabled>Send</button>
+          </div>
+        </section>
+
+        <section class="media-panel hidden" id="voicePanel">
+          <div class="media-copy">
+            <strong>Voice session</strong>
+            <p class="tiny-note">Both browsers will be asked for microphone access.</p>
+          </div>
+          <audio id="remoteAudio" autoplay playsinline></audio>
+          <audio id="localAudio" autoplay muted playsinline></audio>
+        </section>
+
+        <section class="media-panel hidden" id="videoPanel">
+          <div class="video-grid">
+            <div class="video-card">
+              <span class="section-label">Your camera</span>
+              <video id="localVideo" autoplay muted playsinline></video>
+            </div>
+            <div class="video-card">
+              <span class="section-label">Connected browser</span>
+              <video id="remoteVideo" autoplay playsinline></video>
+            </div>
+          </div>
+        </section>
+
+        <section class="empty-mode" id="emptyModePanel">
+          <strong>Connection ready.</strong>
+          <p class="tiny-note">Choose Chat, Voice, or Video to move this session forward.</p>
+        </section>
       </div>
     </section>
   </main>
+
+  <script type="module" src="/frontend/app.js?v=20260707a"></script>
 </body>
 </html>
