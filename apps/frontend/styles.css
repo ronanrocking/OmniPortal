@@ -88,6 +88,147 @@ p {
   max-width: 780px;
 }
 
+.unified-shell {
+  display: grid;
+  gap: 22px;
+}
+
+.hero-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: flex-start;
+}
+
+.pairing-grid,
+.video-grid {
+  display: grid;
+  gap: 18px;
+}
+
+.pairing-grid {
+  margin-top: 26px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.pair-card,
+.comm-section,
+.media-panel,
+.empty-mode,
+.video-card {
+  border-radius: 24px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: var(--shadow);
+}
+
+.pair-card,
+.media-panel,
+.empty-mode,
+.video-card {
+  padding: 20px;
+}
+
+.section-label {
+  display: inline-block;
+  font-size: 0.84rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #7a5a30;
+}
+
+.code-display {
+  margin: 14px 0 12px;
+  font-size: clamp(2.4rem, 6vw, 4rem);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
+.join-row,
+.mode-row,
+.comm-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.join-row {
+  margin: 14px 0 14px;
+}
+
+.pin-input.compact {
+  margin: 0;
+  max-width: none;
+  font-size: 1.8rem;
+}
+
+.comm-section {
+  padding: 24px;
+  display: grid;
+  gap: 18px;
+  align-content: start;
+  min-height: 320px;
+}
+
+.comm-section.locked {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(247, 240, 231, 0.92));
+}
+
+.comm-lock-note {
+  display: block;
+  text-align: center;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px dashed rgba(84, 58, 20, 0.18);
+  background: rgba(255, 251, 244, 0.92);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.comm-header {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.mode-row {
+  flex-wrap: wrap;
+}
+
+.mode-button.active-mode {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.comm-body {
+  display: grid;
+  gap: 16px;
+}
+
+.comm-section.locked .comm-body,
+.comm-section.locked .comm-header,
+.comm-section.locked .session-line {
+  opacity: 0.58;
+}
+
+.media-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.video-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.video-card video {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  margin-top: 12px;
+  border-radius: 18px;
+  background: #111827;
+  object-fit: cover;
+}
+
 .choice-grid,
 .page-grid,
 .panel-grid,
@@ -364,6 +505,13 @@ button:disabled {
 @media (max-width: 940px) {
   .page-grid {
     grid-template-columns: 1fr;
+  }
+
+  .hero-topline,
+  .comm-header,
+  .join-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 

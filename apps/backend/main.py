@@ -24,14 +24,13 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIR = BASE_DIR / "apps" / "frontend"
 
-LANDING_HTML_PATH = FRONTEND_DIR / "index.html"
-HOST_HTML_PATH = FRONTEND_DIR / "host.html"
-CLIENT_HTML_PATH = FRONTEND_DIR / "client.html"
+APP_HTML_PATH = FRONTEND_DIR / "index.html"
 ADMIN_HTML_PATH = FRONTEND_DIR / "admin.html"
 
+ROLE_PEER = "peer"
 ROLE_HOST = "host"
 ROLE_CLIENT = "client"
-ALLOWED_ROLES = {ROLE_HOST, ROLE_CLIENT}
+ALLOWED_ROLES = {ROLE_PEER, ROLE_HOST, ROLE_CLIENT}
 
 HOST_TRANSPORT_BROWSER = "browser"
 HOST_TRANSPORT_INSTALLED = "installed_app"
@@ -463,6 +462,22 @@ def current_session(browser_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return dict(session) if session else None
 
 
+def generate_browser_peer_code(exclude_browser_id: Optional[str] = None) -> str:
+    with STATE_LOCK:
+        used_codes = {
+            host.get("host_code")
+            for browser_id, host in BROWSER_HOSTS.items()
+            if browser_id != exclude_browser_id and host.get("host_code")
+        }
+        used_codes.update(host["host_code"] for host in INSTALLED_HOSTS.values())
+
+    for _ in range(1000):
+        code = f"{int.from_bytes(os.urandom(3), 'big') % 1000000:06d}"
+        if code not in used_codes:
+            return code
+    raise HTTPException(status_code=500, detail="Could not allocate a unique browser code")
+
+
 def upsert_session(browser_id: str, role: str, host_name: Optional[str] = None) -> Dict[str, Any]:
     if role not in ALLOWED_ROLES:
         raise HTTPException(status_code=400, detail="invalid role")
@@ -489,17 +504,18 @@ def clear_existing_host_for_browser(browser_id: str) -> None:
         BROWSER_HOSTS.pop(browser_id, None)
 
 
-def register_browser_host_state(browser_id: str, host_name: str, session_id: str) -> Dict[str, Any]:
+def register_browser_peer_state(browser_id: str, session_id: str) -> Dict[str, Any]:
     now = utc_now_iso()
     with STATE_LOCK:
         existing = BROWSER_HOSTS.get(browser_id)
+        host_code = existing["host_code"] if existing and existing.get("host_code") else generate_browser_peer_code(browser_id)
         host = {
             "host_id": f"legacy-browser-{session_id}",
             "browser_id": browser_id,
-            "display_name": host_name,
-            "host_name": host_name,
-            "host_code": None,
-            "device_name": "Browser host",
+            "display_name": f"Browser {host_code}",
+            "host_name": f"Browser {host_code}",
+            "host_code": host_code,
+            "device_name": "Browser peer",
             "transport": HOST_TRANSPORT_BROWSER,
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
@@ -558,7 +574,7 @@ def host_connection_for_record(host: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if host["transport"] == HOST_TRANSPORT_INSTALLED:
             connection = LIVE_INSTALLED_HOST_CONNECTIONS.get(host["host_id"])
         else:
-            connection = LIVE_BROWSER_HOST_CONNECTIONS.get(host["browser_id"])
+            connection = LIVE_CLIENT_CONNECTIONS.get(host["browser_id"])
         return dict(connection) if connection else None
 
 
@@ -606,17 +622,17 @@ def host_payload(host: Dict[str, Any]) -> Dict[str, Any]:
 
 def connected_host_snapshot() -> List[Dict[str, Any]]:
     with STATE_LOCK:
-        browser_hosts = [host_payload(host) for host in BROWSER_HOSTS.values() if LIVE_BROWSER_HOST_CONNECTIONS.get(host["browser_id"]) is not None]
+        browser_hosts = [host_payload(host) for host in BROWSER_HOSTS.values() if LIVE_CLIENT_CONNECTIONS.get(host["browser_id"]) is not None]
         installed_hosts = [host_payload(host) for host in INSTALLED_HOSTS.values() if LIVE_INSTALLED_HOST_CONNECTIONS.get(host["host_id"]) is not None]
     hosts = browser_hosts + installed_hosts
     return sorted(hosts, key=lambda item: item["created_at"], reverse=True)
 
 
-def connected_client_snapshot() -> List[Dict[str, Any]]:
+def connected_peer_snapshot() -> List[Dict[str, Any]]:
     with STATE_LOCK:
         clients: List[Dict[str, Any]] = []
         for session in SESSIONS.values():
-            if session["role"] != ROLE_CLIENT:
+            if session["role"] != ROLE_PEER:
                 continue
             browser_id = session["browser_id"]
             live_connection = LIVE_CLIENT_CONNECTIONS.get(browser_id)
@@ -633,6 +649,7 @@ def connected_client_snapshot() -> List[Dict[str, Any]]:
                 {
                     "browser_id": browser_id,
                     "session_id": session["session_id"],
+                    "peer_code": BROWSER_HOSTS.get(browser_id, {}).get("host_code"),
                     "connected_at": live_connection["connected_at"],
                     "updated_at": session["updated_at"],
                     "paired": pairing is not None,
@@ -680,10 +697,11 @@ def active_session_snapshot() -> List[Dict[str, Any]]:
                     "session_key": f"browser:{browser_id}",
                     "role": session["role"],
                     "transport": HOST_TRANSPORT_BROWSER,
-                    "display_name": session.get("host_name"),
+                    "display_name": BROWSER_HOSTS.get(browser_id, {}).get("display_name"),
+                    "host_code": BROWSER_HOSTS.get(browser_id, {}).get("host_code"),
                     "browser_id": browser_id,
                     "updated_at": session["updated_at"],
-                    "online": LIVE_CLIENT_CONNECTIONS.get(browser_id) is not None or LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id) is not None,
+                    "online": LIVE_CLIENT_CONNECTIONS.get(browser_id) is not None,
                     "disconnected_at": session.get("disconnected_at"),
                     "paired": pairing is not None,
                 }
@@ -714,7 +732,7 @@ def list_client_visible_hosts() -> List[Dict[str, Any]]:
 
 def admin_overview_payload() -> Dict[str, Any]:
     hosts = connected_host_snapshot()
-    clients = connected_client_snapshot()
+    clients = connected_peer_snapshot()
     connections = active_connection_snapshot()
     sessions = active_session_snapshot()
     return {
@@ -738,7 +756,12 @@ def me_payload(browser_id: str) -> Dict[str, Any]:
 
     online = False
     host_name = None
-    if session["role"] == ROLE_CLIENT:
+    if session["role"] == ROLE_PEER:
+        online = browser_id in LIVE_CLIENT_CONNECTIONS
+        host = BROWSER_HOSTS.get(browser_id)
+        if host is not None:
+            host_name = host["display_name"]
+    elif session["role"] == ROLE_CLIENT:
         online = browser_id in LIVE_CLIENT_CONNECTIONS
     else:
         online = browser_id in LIVE_BROWSER_HOST_CONNECTIONS
@@ -754,6 +777,10 @@ def me_payload(browser_id: str) -> Dict[str, Any]:
     }
     if host_name:
         payload["host_name"] = host_name
+        payload["display_name"] = host_name
+    browser_host = BROWSER_HOSTS.get(browser_id)
+    if browser_host is not None:
+        payload["peer_code"] = browser_host.get("host_code")
     return {"session": payload}
 
 
@@ -764,33 +791,32 @@ def pairing_payload_for_client(pairing: Dict[str, Any]) -> Dict[str, Any]:
         "pair_id": pairing["pair_id"],
         "peer_id": pairing["host_connect_id"],
         "peer_browser_id": pairing["host_connect_id"],
-        "peer_role": ROLE_HOST,
+        "peer_role": ROLE_PEER if host and host.get("transport") == HOST_TRANSPORT_BROWSER else ROLE_HOST,
         "peer_display_name": host["display_name"] if host else None,
     }
 
 
 def pairing_payload_for_host(pairing: Dict[str, Any]) -> Dict[str, Any]:
+    joining_browser = BROWSER_HOSTS.get(pairing["client_browser_id"])
     return {
         "type": "pairing_started",
         "pair_id": pairing["pair_id"],
         "peer_id": pairing["client_browser_id"],
         "peer_browser_id": pairing["client_browser_id"],
-        "peer_role": ROLE_CLIENT,
-        "peer_display_name": "Client",
+        "peer_role": ROLE_PEER,
+        "peer_display_name": joining_browser["display_name"] if joining_browser else "Connected Browser",
     }
 
 
 def validate_host_availability(connect_id: str) -> Tuple[bool, str]:
     host = get_host_record_by_connect_id(connect_id)
     if host is None:
-        return False, "Selected host does not exist."
-    if host.get("transport") != HOST_TRANSPORT_INSTALLED:
-        return False, "Selected host is not a supported desktop host."
+        return False, "Selected browser does not exist."
     if host_connection_for_record(host) is None:
-        return False, "Selected host is offline."
+        return False, "Selected browser is offline."
     with STATE_LOCK:
         if PAIRINGS.get(connect_id) is not None:
-            return False, "Selected host is already paired."
+            return False, "Selected browser is already paired."
     return True, ""
 
 
@@ -846,7 +872,7 @@ def get_live_socket_for_peer(peer_id: str) -> Optional[WebSocket]:
             connection = LIVE_INSTALLED_HOST_CONNECTIONS.get(host_id)
         elif peer_id.startswith("browser-host:"):
             browser_id = peer_id.removeprefix("browser-host:")
-            connection = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
+            connection = LIVE_CLIENT_CONNECTIONS.get(browser_id)
         else:
             connection = LIVE_CLIENT_CONNECTIONS.get(peer_id)
         return connection["websocket"] if connection else None
@@ -855,7 +881,6 @@ def get_live_socket_for_peer(peer_id: str) -> Optional[WebSocket]:
 def all_live_websockets() -> List[WebSocket]:
     with STATE_LOCK:
         sockets = [item["websocket"] for item in LIVE_CLIENT_CONNECTIONS.values()]
-        sockets.extend(item["websocket"] for item in LIVE_BROWSER_HOST_CONNECTIONS.values())
         sockets.extend(item["websocket"] for item in LIVE_INSTALLED_HOST_CONNECTIONS.values())
     return sockets
 
@@ -864,7 +889,7 @@ def mark_browser_connection_activity(browser_id: str, role: str) -> None:
     now_iso = utc_now_iso()
     now_monotonic = monotonic_now()
     with STATE_LOCK:
-        if role == ROLE_CLIENT:
+        if role in {ROLE_CLIENT, ROLE_PEER}:
             connection = LIVE_CLIENT_CONNECTIONS.get(browser_id)
         else:
             connection = LIVE_BROWSER_HOST_CONNECTIONS.get(browser_id)
@@ -877,12 +902,11 @@ def mark_browser_connection_activity(browser_id: str, role: str) -> None:
             session["updated_at"] = now_iso
             session["disconnected_at"] = None
 
-        if role == ROLE_HOST:
-            host = BROWSER_HOSTS.get(browser_id)
-            if host is not None:
-                host["updated_at"] = now_iso
-                host["disconnected_at"] = None
-                host["last_online"] = now_iso
+        host = BROWSER_HOSTS.get(browser_id)
+        if host is not None:
+            host["updated_at"] = now_iso
+            host["disconnected_at"] = None
+            host["last_online"] = now_iso
 
 
 def mark_installed_host_activity(host_id: str) -> None:
@@ -978,7 +1002,7 @@ async def connect_browser_websocket(browser_id: str, role: str, websocket: WebSo
     now_monotonic = monotonic_now()
 
     with STATE_LOCK:
-        if role == ROLE_CLIENT:
+        if role in {ROLE_CLIENT, ROLE_PEER}:
             existing = LIVE_CLIENT_CONNECTIONS.get(browser_id)
             if existing is not None:
                 previous_socket = existing["websocket"]
@@ -1051,11 +1075,11 @@ async def expire_browser_connection(browser_id: str, reason: str, role: Optional
     with STATE_LOCK:
         if resolved_role is None:
             if browser_id in LIVE_CLIENT_CONNECTIONS:
-                resolved_role = ROLE_CLIENT
+                resolved_role = ROLE_PEER
             elif browser_id in LIVE_BROWSER_HOST_CONNECTIONS:
                 resolved_role = ROLE_HOST
 
-        if resolved_role == ROLE_CLIENT:
+        if resolved_role in {ROLE_CLIENT, ROLE_PEER}:
             existing = LIVE_CLIENT_CONNECTIONS.get(browser_id)
             if existing is None:
                 return
@@ -1081,9 +1105,10 @@ async def expire_browser_connection(browser_id: str, reason: str, role: Optional
             session["updated_at"] = now_iso
             session["disconnected_at"] = now_iso
 
-    participant_id = browser_id if resolved_role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+    participant_id = browser_id
     logger.info("browser_socket_expired browser_id=%s role=%s reason=%s", browser_id, resolved_role, reason)
     await clear_pairing_and_notify(participant_id, reason, initiator=participant_id)
+    await clear_pairing_and_notify(browser_host_connect_id(browser_id), reason, initiator=browser_id)
     if websocket is None:
         await close_socket_safe(socket_to_close, 4001, reason)
     await broadcast_system_state()
@@ -1211,60 +1236,17 @@ async def shutdown_event() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request) -> HTMLResponse:
-    return serve_page(LANDING_HTML_PATH, browser_id=ensure_browser_id(request))
+    return serve_page(APP_HTML_PATH, browser_id=ensure_browser_id(request))
 
 
 @app.get("/host", response_class=HTMLResponse)
-def host_page() -> HTMLResponse:
-    return HTMLResponse(
-        """
-        <!doctype html>
-        <html lang="en">
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>OmniPortal Host Moved</title>
-          <style>
-            body {
-              margin: 0;
-              min-height: 100vh;
-              display: grid;
-              place-items: center;
-              font-family: "Trebuchet MS", "Segoe UI", sans-serif;
-              background: linear-gradient(180deg, #f8f2e8 0%, #ece3d6 100%);
-              color: #2c2219;
-            }
-            main {
-              max-width: 680px;
-              margin: 24px;
-              padding: 28px;
-              border-radius: 24px;
-              background: rgba(255, 252, 245, 0.94);
-              border: 1px solid rgba(84, 58, 20, 0.14);
-              box-shadow: 0 24px 64px rgba(59, 37, 15, 0.12);
-            }
-            a {
-              color: #115e59;
-              font-weight: 700;
-            }
-          </style>
-        </head>
-        <body>
-          <main>
-            <h1>Browser hosting has moved</h1>
-            <p>The browser host page is no longer active. Hosts now run through the installed OmniPortal Host desktop app.</p>
-            <p><a href="/client">Open the client page</a> or <a href="/admin">open the admin dashboard</a>.</p>
-          </main>
-        </body>
-        </html>
-        """,
-        status_code=410,
-    )
+def host_page(request: Request) -> HTMLResponse:
+    return serve_page(APP_HTML_PATH, browser_id=ensure_browser_id(request))
 
 
 @app.get("/client", response_class=HTMLResponse)
 def client_page(request: Request) -> HTMLResponse:
-    return serve_page(CLIENT_HTML_PATH, browser_id=ensure_browser_id(request))
+    return serve_page(APP_HTML_PATH, browser_id=ensure_browser_id(request))
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1347,17 +1329,22 @@ async def register_host_v1(payload: HostV1RegisterRequest) -> Dict[str, Any]:
 @app.post("/api/client/join")
 async def join_client(request: Request, response: Response) -> Dict[str, Any]:
     browser_id = ensure_browser_id(request)
-    logger.info("client_join_requested browser_id=%s", browser_id)
+    logger.info("peer_join_requested browser_id=%s", browser_id)
 
     await clear_pairing_and_notify(browser_id, "role_changed", initiator=browser_id)
     await clear_pairing_and_notify(browser_host_connect_id(browser_id), "role_changed", initiator=browser_host_connect_id(browser_id))
     await expire_browser_connection(browser_id, "role_changed")
-    clear_existing_host_for_browser(browser_id)
 
-    session = upsert_session(browser_id, ROLE_CLIENT)
+    session = upsert_session(browser_id, ROLE_PEER)
+    register_browser_peer_state(browser_id, session["session_id"])
     set_identity_cookies(response, browser_id, session["session_id"])
     await broadcast_system_state()
     return {"session": session}
+
+
+@app.post("/api/peer/join")
+async def join_peer(request: Request, response: Response) -> Dict[str, Any]:
+    return await join_client(request, response)
 
 
 @app.post("/api/session/reset")
@@ -1385,12 +1372,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     session = current_session(browser_id)
     if session is None or session["role"] not in ALLOWED_ROLES:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="A host or client session is required.")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="A browser session is required.")
         return
 
     role = session["role"]
-    if role == ROLE_HOST:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Browser hosting has been retired.")
+    if role != ROLE_PEER:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="This socket is reserved for browser peer sessions.")
         return
 
     await websocket.accept()
@@ -1402,7 +1389,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         websocket,
         {
             "type": "welcome",
-            "peer_id": browser_host_connect_id(browser_id) if role == ROLE_HOST else browser_id,
+            "peer_id": browser_id,
             "browser_id": browser_id,
             "role": session["role"] if session else None,
             "session_id": session["session_id"] if session else None,
@@ -1420,10 +1407,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             if message_type == "connect_to_host":
-                if role != ROLE_CLIENT:
-                    await send_json_safe(websocket, {"type": "error", "message": "Only clients can connect to hosts."})
-                    continue
-
                 connect_id = payload.get("connect_id")
                 legacy_host_browser_id = payload.get("host_browser_id")
                 requested_host_code = payload.get("host_code")
@@ -1439,16 +1422,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     except HTTPException:
                         connect_id = None
                 if not isinstance(requested_host_code, str) or not requested_host_code.strip():
-                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit host PIN is required."})
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit browser code is required."})
                     continue
                 try:
                     normalized_requested_code = normalize_host_code(requested_host_code.strip())
                 except HTTPException:
-                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit host PIN is required."})
+                    await send_json_safe(websocket, {"type": "error", "message": "A valid 6-digit browser code is required."})
                     continue
                 if not isinstance(connect_id, str) or not connect_id:
                     logger.info("pairing_rejected_no_host browser_id=%s host_code=%s", browser_id, normalized_requested_code)
-                    await send_json_safe(websocket, {"type": "error", "message": "No online host was found for that PIN."})
+                    await send_json_safe(websocket, {"type": "error", "message": "No online browser was found for that code."})
+                    continue
+                if connect_id == browser_host_connect_id(browser_id):
+                    await send_json_safe(websocket, {"type": "error", "message": "You cannot connect to your own code."})
                     continue
 
                 await clear_pairing_and_notify(browser_id, "replaced_by_new_pair", initiator=browser_id)
@@ -1468,7 +1454,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 host = get_host_record_by_connect_id(connect_id)
                 if host is None:
                     logger.info("pairing_rejected_missing_host browser_id=%s host=%s", browser_id, connect_id)
-                    await send_json_safe(websocket, {"type": "error", "message": "Selected host does not exist."})
+                    await send_json_safe(websocket, {"type": "error", "message": "Selected browser does not exist."})
                     continue
 
                 if host.get("host_code") != normalized_requested_code:
@@ -1479,7 +1465,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         normalized_requested_code,
                         host.get("host_code"),
                     )
-                    await send_json_safe(websocket, {"type": "error", "message": "The host PIN did not match the selected host."})
+                    await send_json_safe(websocket, {"type": "error", "message": "That code did not match the selected browser."})
                     continue
 
                 pairing = create_pairing(connect_id, browser_id)
@@ -1487,7 +1473,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if host_socket is None:
                     logger.info("pairing_rejected_host_offline browser_id=%s host=%s", browser_id, connect_id)
                     await clear_pairing_and_notify(browser_id, "host_went_offline", initiator=connect_id)
-                    await send_json_safe(websocket, {"type": "error", "message": "Selected host went offline."})
+                    await send_json_safe(websocket, {"type": "error", "message": "Selected browser went offline."})
                     continue
 
                 client_payload = pairing_payload_for_client(pairing)
@@ -1501,7 +1487,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             if message_type == "leave_pair":
-                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                participant_id = browser_id if PAIRINGS.get(browser_id) is not None else browser_host_connect_id(browser_id)
                 await clear_pairing_and_notify(participant_id, "left_by_user", initiator=participant_id)
                 continue
 
@@ -1510,7 +1496,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if not isinstance(state_value, str) or not state_value:
                     await send_json_safe(websocket, {"type": "error", "message": "A valid RTC state is required."})
                     continue
-                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                participant_id = browser_id if PAIRINGS.get(browser_id) is not None else browser_host_connect_id(browser_id)
                 try:
                     await mark_pairing_state(participant_id, state_value)
                 except HTTPException as error:
@@ -1527,14 +1513,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_json_safe(websocket, {"type": "error", "message": "Signal target is required."})
                     continue
 
-                participant_id = browser_id if role == ROLE_CLIENT else browser_host_connect_id(browser_id)
+                participant_id = browser_id if PAIRINGS.get(browser_id) is not None else browser_host_connect_id(browser_id)
                 with STATE_LOCK:
                     pairing = PAIRINGS.get(participant_id)
                 if pairing is None:
                     await send_json_safe(websocket, {"type": "error", "message": "No active peer is available for signaling."})
                     continue
 
-                expected_peer_id = pairing["host_connect_id"] if role == ROLE_CLIENT else pairing["client_browser_id"]
+                expected_peer_id = pairing["host_connect_id"] if participant_id == pairing["client_browser_id"] else pairing["client_browser_id"]
                 if expected_peer_id != target_peer_id:
                     await send_json_safe(websocket, {"type": "error", "message": "Signal target is not the current peer."})
                     continue
